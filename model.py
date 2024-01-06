@@ -665,6 +665,108 @@ class MSATransition(torch.nn.Module):
         return m
 
 
+class OuterProductMean(torch.nn.Module):
+    def __init__(self, c=32):
+        super().__init__()
+
+        self.c = c
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.linear_a = torch.nn.Linear(c, c)
+        self.linear_b = torch.nn.Linear(c, c)
+        self.linear_out = torch.nn.Linear(c * c, c)
+
+    def forward(self, m):
+        """
+        Algorithm 10: Outer product mean
+
+        m: (B, s, i, c)
+
+        return: (B, i, j, c)
+        """
+
+        m = self.layer_norm(m)
+
+        a, b = self.linear_a(m), self.linear_b(m)
+        outer = a.unsqueeze(2) * b.unsqueeze(3)
+        outer = outer.mean(dim=1)
+
+        return self.linear_out(outer) # (B, i, j, c)
+
+
+class ExtraMSAStackBlock(torch.nn.Module):
+    def __init__(self, c=8, n=4, n_head=4, p=0.25):
+        super().__init__()
+
+        self.c = c
+        self.n = n
+        self.n_head = n_head
+        self.p = p
+
+        self.dropout_row = DropoutRowwise(p)
+        self.dropout_col = DropoutColumnwise(p)
+
+        self.msa_row_attn = MSARowAttentionWithPairBias(c, n_head)
+        self.msa_col_attn = MSAColumnGlobalAttention(c, n_head)
+        self.msa_col_global_attn = MSAColumnGlobalAttention(c, n_head)
+        self.msa_transition = MSATransition(c, n)
+        self.outer_product_mean = OuterProductMean(c)
+
+        self.tri_mul_out = TriangleMultiplicationOutgoing(c)
+        self.tri_mul_in = TriangleMultiplicationIncoming(c)
+        self.tri_attn_start = TriangleAttentionStartingNode(c, c, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c, c, n_head)
+        self.pair_transition = PairTransition(c, n)
+    
+    def forward(self, e, z):
+        """
+        Algorithm 18: Extra MSA Stack (Block)
+
+        e: (B, s, i, c)
+        z: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        # MSA Stack
+        e += self.dropout_row(self.msa_row_attn(e, z))
+        e += self.msa_col_attn(e)
+        e += self.msa_transition(e)
+
+        # Communication
+        z += self.outer_product_mean(e)
+
+        # Pair Stack
+        z += self.dropout_row(self.tri_mul_out(z))
+        z += self.dropout_row(self.tri_mul_in(z))
+        z += self.dropout_row(self.tri_attn_start(z))
+        z += self.dropout_col(self.tri_attn_end(z))
+        z += self.pair_transition(z)
+
+        return z
+    
+
+class ExtraMSAStack(torch.nn.Module):
+    def __init__(self, n_block, c=8, n=4, n_head=4, p=0.25):
+        super().__init__()
+
+        self.n_block = n_block
+        self.c = c
+        self.n = n
+        self.n_head = n_head
+        self.p = p
+
+        self.blocks = torch.nn.ModuleList([
+                ExtraMSAStackBlock(c, n, n_head, p)
+                for _ in range(n_block)
+        ])
+    
+    def forward(self, e, z):
+        for block in self.blocks:
+            e = block(e, z)
+
+        return e
+
 B, s, i, j, d = 1, 512, 227, 227, 32
 x = torch.randn(B, s, i, d).cuda()
 model = MSAColumnGlobalAttention(d, 8).cuda()

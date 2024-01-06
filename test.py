@@ -1,7 +1,11 @@
 import torch
 
-x = torch.randn(1, 10)
-y = torch.randn(10, 1)
-z = x - y
 
-print(z, z.shape)
+B, s, i, j, c = 1, 512, 227, 227, 64
+
+x = torch.randn(B, s, i, c).half()
+y = torch.randn(B, s, j, c).half()
+
+outer = x.unsqueeze(2) * y.unsqueeze(3)
+outer = outer.mean(dim=1)
+print(outer.shape)
