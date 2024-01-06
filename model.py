@@ -190,143 +190,111 @@ class DropoutColumnwise(torch.nn.Module):
 
 
 class TriangleAttentionStartingNode(torch.nn.Module):
-    def __init__(self, c=32, n_head=4):
+    def __init__(self, c=32, c_z=32, n_head=4):
         super().__init__()
-
         self.c = c
+        self.c_z = c_z
         self.n_head = n_head
-        self.d = c * n_head
 
-        self.layernorm = torch.nn.LayerNorm(self.d)
+        self.layer_norm = torch.nn.LayerNorm(c)
 
+        self.query = torch.nn.Linear(c, c * n_head, bias=False)
+        self.key = torch.nn.Linear(c, c * n_head, bias=False)
+        self.value = torch.nn.Linear(c, c * n_head, bias=False)
 
-        self.proj_q = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_k = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_v = torch.nn.Linear(self.d, self.d, bias=False)
-
-        self.proj_b = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_g = torch.nn.Linear(self.d, self.d)
-
-        self.proj_o = torch.nn.Linear(self.d, self.d)
-
+        self.bias = torch.nn.Linear(c, n_head, bias=False)
+        self.gate = torch.nn.Linear(c, c * n_head)
+        self.output = torch.nn.Linear(c * n_head, c)
         self.sigmoid = torch.nn.Sigmoid()
-
+        
     def forward(self, z):
         """
         Algorithm 13: Triangular gated self-attention around starting node
 
-        z: (B, i, j, d)
+        z: (B, i, j, c)
 
-        d = 128 => h = 4, c = 32
-
-        return: (B, i, j, d)
+        return: (B, i, j, c_z)
         """
+        
+        z = self.layer_norm(z) # (B, i, j, c)
 
-        z = self.layernorm(z) # (B, i, j, d)
+        q, k, v = self.query(z), self.key(z), self.value(z) # (B, i, j, c * h)
+        b = self.bias(z) # (B, i, j, h)
+        g = torch.sigmoid(self.gate(z)) # (B, i, j, c * h)
 
-        q, k, v = self.proj_q(z), self.proj_k(z), self.proj_v(z) # (B, i, j, d)
-        b = self.proj_b(z) # (B, j, k, d)
-        g = self.sigmoid(self.proj_g(z)) # (B, i, j, d)
+        B, i, j, _ = q.shape
+        h, c = self.n_head, self.c
 
-        B, i, j, d = q.shape
-        q = q.view(B, i, j, self.n_head, self.c)
-        k = k.view(B, i, j, self.n_head, self.c)
-        v = v.view(B, i, j, self.n_head, self.c)
-        b = b.view(B, i, j, self.n_head, self.c)
-        g = g.view(B, i, j, self.n_head, self.c)
+        q = q.view(B, i, j, h, c) # (B, i, j, h, c)
+        k = k.view(B, i, j, h, c)
+        v = v.view(B, i, j, h, c)
+        g = g.view(B, i, j, h, c)
+        b = b.view(B, i, j, 1, self.n_head) # (B, i, j, 1, h)
 
-        q = q.permute(0, 3, 1, 2, 4) # (B, h, i, j, c)
-        k = k.permute(0, 3, 1, 2, 4)
-        v = v.permute(0, 3, 1, 2, 4)
-        b = b.permute(0, 3, 1, 2, 4)
-        g = g.permute(0, 3, 1, 2, 4)
+        a = torch.einsum("b i q h c, b i v h c -> b i q v h", q, k) * (self.c ** -0.5) + b # (B, i, r_q, r_v, h)
+        a = torch.nn.functional.softmax(a, dim=-2) # (B, i, r_q, r_v, h)
+        
+        o = g * torch.einsum("b i q v h, b i v h c -> b i q h c", a, v) # (B, i, r_q, h, c)
+        o = o.view(B, i, j, self.n_head * self.c) # (B, i, j, h * c)
 
-        a = torch.einsum("b h i j c, b h i k c -> b h j k c", q, k) # (B, h, j, k, c)
-        a /= (self.c ** 0.5)
-        a += b # (B, h, j, k, c)
-
-        a = torch.nn.functional.softmax(a, dim=-2) # (B, h, j, k, c)
-
-        o = g * torch.einsum("b h j k c, b h i k c -> b h i j c", a, v)
-        o = o.permute(0, 2, 3, 1, 4)
-        o = o.view(B, i, j, self.d)
-
-        o = self.proj_o(o) # (B, i, j, d)
-
-        return o
+        return self.output(o) # (B, i, j, c_z)
+    
 
 class TriangleAttentionEndingNode(torch.nn.Module):
-    def __init__(self, c=32, n_head=4):
+    def __init__(self, c=32, c_z=32, n_head=4):
         super().__init__()
-
         self.c = c
+        self.c_z = c_z
         self.n_head = n_head
-        self.d = c * n_head
 
-        self.layernorm = torch.nn.LayerNorm(self.d)
+        self.layer_norm = torch.nn.LayerNorm(c)
 
+        self.query = torch.nn.Linear(c, c * n_head, bias=False)
+        self.key = torch.nn.Linear(c, c * n_head, bias=False)
+        self.value = torch.nn.Linear(c, c * n_head, bias=False)
 
-        self.proj_q = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_k = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_v = torch.nn.Linear(self.d, self.d, bias=False)
-
-        self.proj_b = torch.nn.Linear(self.d, self.d, bias=False)
-        self.proj_g = torch.nn.Linear(self.d, self.d)
-
-        self.proj_o = torch.nn.Linear(self.d, self.d)
-
+        self.bias = torch.nn.Linear(c, n_head, bias=False)
+        self.gate = torch.nn.Linear(c, c * n_head)
+        self.output = torch.nn.Linear(c * n_head, c)
         self.sigmoid = torch.nn.Sigmoid()
-
+        
     def forward(self, z):
         """
         Algorithm 14: Triangular gated self-attention around ending node
 
-        z: (B, i, j, d)
+        z: (B, i, j, c)
 
-        d = 128 => h = 4, c = 32
-
-        return: (B, i, j, d)
+        return: (B, i, j, c)
         """
+        
+        z = z.tranpose(-2, -3) # Ending node, flips i and j
+        z = self.layer_norm(z) # (B, i, j, c)
 
-        z = self.layernorm(z) # (B, i, j, d)
+        q, k, v = self.query(z), self.key(z), self.value(z) # (B, i, j, c * h)
+        b = self.bias(z) # (B, i, j, h)
+        g = torch.sigmoid(self.gate(z)) # (B, i, j, c * h)
 
-        q, k, v = self.proj_q(z), self.proj_k(z), self.proj_v(z) # (B, i, j, d)
-        b = self.proj_b(z) # (B, j, k, d)
-        g = self.sigmoid(self.proj_g(z)) # (B, i, j, d)
+        B, i, j, _ = q.shape
+        h, c = self.n_head, self.c
 
-        B, i, j, d = q.shape
-        q = q.view(B, i, j, self.n_head, self.c)
-        k = k.view(B, i, j, self.n_head, self.c)
-        v = v.view(B, i, j, self.n_head, self.c)
-        b = b.view(B, i, j, self.n_head, self.c)
-        g = g.view(B, i, j, self.n_head, self.c)
+        q = q.view(B, i, j, h, c) # (B, i, j, h, c)
+        k = k.view(B, i, j, h, c)
+        v = v.view(B, i, j, h, c)
+        g = g.view(B, i, j, h, c)
+        b = b.view(B, i, j, 1, self.n_head) # (B, i, j, 1, h)
 
-        q = q.permute(0, 3, 1, 2, 4) # (B, h, i, j, c)
-        k = k.permute(0, 3, 1, 2, 4)
-        v = v.permute(0, 3, 1, 2, 4)
-        b = b.permute(0, 3, 1, 2, 4)
-        g = g.permute(0, 3, 1, 2, 4)
+        a = torch.einsum("b i q h c, b i v h c -> b i q v h", q, k) * (self.c ** -0.5) + b # (B, i, r_q, r_v, h)
+        a = torch.nn.functional.softmax(a, dim=-2)
 
-        a = torch.einsum("b h i j c, b h k j c -> b h k i c", q, k) # (B, h, k, i, c)
-        a /= (self.c ** 0.5)
-        a += b # (B, h, j, k, c)
+        o = g * torch.einsum("b i q v h, b i v h c -> b i q h c", a, v) # (B, i, r_q, h, c)
+        o = o.view(B, i, j, self.n_head * self.c) # (B, i, j, h * c)
 
-        a = torch.nn.functional.softmax(a, dim=-2) # (B, h, j, k, c)
-
-        o = g * torch.einsum("b h i j c, b h k j c -> b h i j c", a, v)
-        o = o.permute(0, 2, 3, 1, 4)
-        o = o.view(B, i, j, self.d)
-
-        o = self.proj_o(o) # (B, i, j, d)
-
-        return o
+        return self.output(o).transpose(-2, -3) # (B, i, j, c_z)
 
 
-class TriangleMultiplicationOutgoing(torch.nn.Module):
-    
-
-B, i, j, d = 1, 227, 227, 128
+B, i, j, d = 1, 227, 227, 32
 x = torch.randn(B, i, j, d).cuda()
-model = TriangleAttentionEndingNode().cuda()
+model = TriangleAttentionStartingNode(c=d).cuda()
 
+print(x.shape)
 print(model(x).shape)
