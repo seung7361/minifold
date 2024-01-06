@@ -452,9 +452,55 @@ class TemplatePairStack(torch.nn.Module):
 
         return self.layer_norm(t)
 
-B, i, j, d = 1, 227, 227, 32
-x = torch.randn(B, i, j, d).cuda()
-model = TemplatePairStackBlock(d, 4, 4).cuda()
 
-print(x.shape)
-print(model(x).shape)
+class TemplatePointwiseAttention(torch.nn.Module):
+    def __init__(self, c=64, n_head=4):
+        super().__init__()
+
+        self.c = c
+        self.n_head = n_head
+
+        self.proj_q = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_k = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_v = torch.nn.Linear(c, c * n_head, bias=False)
+
+        self.proj_o = torch.nn.Linear(c * n_head, c)
+    
+    def forward(self, t, z):
+        """
+        Algorithm 17: Template Pointwise Attention
+
+        t: (B, s, i, j, c). s: N_templ, i: N_res, j: N_res
+        z: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        q = self.proj_q(z) # (B, i, j, c * h)
+        k = self.proj_k(t) # (B, s, i, j, c * h)
+        v = self.proj_v(t)
+
+        B, s, i, j, _ = k.shape
+        h, c = self.n_head, self.c
+
+        q = q.view(B, i, j, h, c) # (B, i, j, h, c)
+        k = k.view(B, s, i, j, h, c) # (B, s, i, j, h, c)
+        v = v.view(B, s, i, j, h, c)
+
+        a = torch.einsum("b i j h c, b s i j h c -> b s i j h", q, k) * (self.c ** -0.5)
+        a = torch.nn.functional.softmax(a, dim=1) # (B, s, i, j, h)
+
+        o = torch.einsum("b s i j h, b s i j h c -> b i j h c", a, v) # (B, i, j, h, c)
+        o = o.view(B, i, j, h * c)
+
+        return self.proj_o(o) # (B, i, j, c)
+
+
+B, s, i, j, d = 1, 512, 227, 227, 32
+t = torch.randn(B, s, i, j, d).cuda()
+z = torch.randn(B, i, j, d).cuda()
+model = TemplatePointwiseAttention(d).cuda()
+
+print("t shape: ", t.shape)
+print("z shape: ", z.shape)
+print(model(t, z).shape)
