@@ -767,6 +767,91 @@ class ExtraMSAStack(torch.nn.Module):
 
         return e
 
+
+class EvoformerBlock(torch.nn.Module):
+    def __init__(self, n_block=48, c_s=384, n_head=8, p=0.25):
+        super().__init__()
+
+        self.n_block = n_block
+        self.c_s = c_s
+
+        self.dropout_row = DropoutRowwise(p)
+        self.dropout_col = DropoutColumnwise(p)
+
+        self.msa_row_attn = MSARowAttentionWithPairBias(c_s, n_head)
+        self.msa_col_attn = MSAColumnAttention(c_s, n_head)
+        self.msa_transition = MSATransition(c_s)
+
+        self.outer_product_mean = OuterProductMean(c_s)
+
+        self.tri_mul_out = TriangleMultiplicationOutgoing(c_s)
+        self.tri_mul_in = TriangleMultiplicationIncoming(c_s)
+        self.tri_attn_start = TriangleAttentionStartingNode(c_s, c_s, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c_s, c_s, n_head)
+        self.pair_transition = PairTransition(c_s)
+
+    def forward(self, m, z):
+        """
+        Algorithm 6: Evoformer stack (Block)
+
+        m: (B, s, i, c)
+        z: (B, i, j, c)
+
+        return: [
+            m: (B, s, i, c),
+            z: (B, i, j, c)
+        ]
+        """
+
+        # MSA Stack
+        m += self.dropout_row(self.msa_row_attn(m, z))
+        m += self.msa_col_attn(m)
+        m += self.msa_transition(m)
+
+        # Communication
+        z += self.outer_product_mean(m)
+
+        # Pair Stack
+        z += self.dropout_row(self.tri_mul_out(z))
+        z += self.dropout_row(self.tri_mul_in(z))
+        z += self.dropout_row(self.tri_attn_start(z))
+        z += self.dropout_col(self.tri_attn_end(z))
+        z += self.pair_transition(z)
+
+        return m, z
+
+
+class Evoformer(torch.nn.Module):
+    def __init__(self, n_block=48, c_s=384, n_head=8, p=0.25):
+        super().__init__()
+
+        self.n_block = n_block
+        self.c_s = c_s
+        self.n_head = n_head
+        self.p = p
+
+        self.blocks = torch.nn.ModuleList([
+                EvoformerBlock(n_block, c_s, n_head, p)
+                for _ in range(n_block)
+        ])
+        self.proj_o = torch.nn.Linear(c_s, c_s)
+    
+    def forward(self, m, z):
+        """
+        return: [
+            m: (B, s, i, c),
+            z: (B, i, j, c),
+            s: (B, i, c_s)
+        ]
+        """
+        for block in self.blocks:
+            m, z = block(m, z)
+
+        s = self.proj_o(m[:, 0, :, :])
+
+        return m, z, s
+
+
 B, s, i, j, d = 1, 512, 227, 227, 32
 x = torch.randn(B, s, i, d).cuda()
 model = MSAColumnGlobalAttention(d, 8).cuda()
