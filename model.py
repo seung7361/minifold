@@ -267,7 +267,7 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         return: (B, i, j, c)
         """
         
-        z = z.tranpose(-2, -3) # Ending node, flips i and j
+        z = z.transpose(-2, -3) # Ending node, flips i and j
         z = self.layer_norm(z) # (B, i, j, c)
 
         q, k, v = self.query(z), self.key(z), self.value(z) # (B, i, j, c * h)
@@ -364,10 +364,97 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
         return gate * self.proj_o(self.layer_norm_out(torch.einsum("... k i c, ... k j c -> ... i j c", a, b)))
 
 
+class PairTransition(torch.nn.Module):
+    def __init__(self, c=128, n=4):
+        super().__init__()
+
+        self.c = c
+        self.n = n
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.proj_in = torch.nn.Linear(c, c * 4)
+        self.proj_out = torch.nn.Linear(c * 4, c)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, z):
+        """
+        Algorithm 15: Transition layer in the pair stack
+
+        z: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        z = self.layer_norm(z)
+
+        z = self.proj_in(z)
+        z = self.relu(z)
+        z = self.proj_out(z)
+
+        return z
+
+
+class TemplatePairStackBlock(torch.nn.Module):
+    def __init__(self, c=64, n=4, n_head=4, p=0.25):
+        super().__init__()
+
+        self.c = c
+        self.n = n
+        self.n_head = n_head
+        self.p = p
+
+        self.dropout_row = DropoutRowwise(p)
+        self.dropout_col = DropoutColumnwise(p)
+
+        self.tri_attn_start = TriangleAttentionStartingNode(c, c, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c, c, n_head)
+        self.tri_mult_out = TriangleMultiplicationOutgoing(c)
+        self.tri_mult_in = TriangleMultiplicationIncoming(c)
+        self.pair_transition = PairTransition(c, n)
+    
+    def forward(self, t):
+        """
+        Algorithm 16: Template Pair Stack (Block)
+
+        t: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        t += self.dropout_row(self.tri_attn_start(t))
+        t += self.dropout_col(self.tri_attn_end(t))
+        t = self.dropout_row(self.tri_mult_out(t))
+        t = self.dropout_row(self.tri_mult_in(t))
+        t += self.pair_transition(t)
+
+        return t
+
+
+class TemplatePairStack(torch.nn.Module):
+    def __init__(self, n_block, c=64, n=4, n_head=4, p=0.25):
+        super().__init__()
+
+        self.n_block = n_block
+        self.c = c
+        self.n = n
+        self.n_head = n_head
+        self.p = p
+
+        self.blocks = torch.nn.ModuleList([
+                TemplatePairStackBlock(c, n, n_head, p)
+                for _ in range(n_block)
+        ])
+        self.layer_norm = torch.nn.LayerNorm(c)
+    
+    def forward(self, t):
+        for block in self.blocks:
+            t = block(t)
+
+        return self.layer_norm(t)
 
 B, i, j, d = 1, 227, 227, 32
 x = torch.randn(B, i, j, d).cuda()
-model = TriangleMultiplicationIncoming(c=d).cuda()
+model = TemplatePairStackBlock(d, 4, 4).cuda()
 
 print(x.shape)
 print(model(x).shape)
