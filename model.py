@@ -496,11 +496,178 @@ class TemplatePointwiseAttention(torch.nn.Module):
         return self.proj_o(o) # (B, i, j, c)
 
 
-B, s, i, j, d = 1, 512, 227, 227, 32
-t = torch.randn(B, s, i, j, d).cuda()
-z = torch.randn(B, i, j, d).cuda()
-model = TemplatePointwiseAttention(d).cuda()
+class MSARowAttentionWithPairBias(torch.nn.Module):
+    def __init__(self, c=32, n_head=8):
+        super().__init__()
 
-print("t shape: ", t.shape)
-print("z shape: ", z.shape)
-print(model(t, z).shape)
+        self.c = c
+        self.n_head = n_head
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.layer_norm_b = torch.nn.LayerNorm(c)
+
+        self.proj_q = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_k = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_v = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_b = torch.nn.Linear(c, n_head, bias=False)
+        self.proj_g = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_o = torch.nn.Linear(c * n_head, c)
+
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, m, z):
+        """
+        Algorithm 7: MSA row-wise gated self-attention with pair bias
+
+        m: (B, s, i, c)
+        z: (B, i, j, c)
+
+        return: (B, s, i, c)
+        """
+
+        m = self.layer_norm(m)
+
+        q, k, v = self.proj_q(m), self.proj_k(m), self.proj_v(m)
+        b = self.proj_b(self.layer_norm_b(z)) # (B, i, j, h)
+        gate = self.sigmoid(self.proj_g(m))
+
+        B, s, i, _ = q.shape
+        h, c = self.n_head, self.c
+
+        q = q.view(B, s, i, h, c) # (B, s, i, h, c)
+        k = k.view(B, s, i, h, c)
+        v = v.view(B, s, i, h, c)
+        b = b.view(B, 1, i, j, h) # (B, 1, i, j, h)
+
+        a = torch.einsum("b s i h c, b s j h c -> b s i j h", q, k) * (self.c ** -0.5) + b # (B, s, i, j, h)
+        a = torch.nn.functional.softmax(a, dim=-2) # (B, s, i, j, h)
+
+        o = gate * torch.einsum("b s i j h, b s j h c -> b s i h c", a, v) # (B, s, i, h, c)
+        o = o.view(B, s, i, h * c) # (B, s, i, h * c)
+
+        return self.proj_o(o) # (B, s, i, c)
+
+    
+class MSAColumnAttention(torch.nn.Module):
+    def __init__(self, c=32, n_head=8):
+        super().__init__()
+
+        self.c = c
+        self.n_head = n_head
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+
+        self.proj_q = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_k = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_v = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_g = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_o = torch.nn.Linear(c * n_head, c)
+
+    def forward(self, m):
+        """
+        Algorithm 8: MSA column-wise gated self-attention
+
+        m: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        m = self.layer_norm(m)
+
+        q, k, v = self.proj_q(m), self.proj_k(m), self.proj_v(m)
+        gate = self.sigmoid(self.proj_g(m))
+
+        B, s, i, _ = q.shape
+        h, c = self.n_head, self.c
+
+        q = q.view(B, s, i, h, c)
+        k = k.view(B, s, i, h, c)
+        v = v.view(B, s, i, h, c)
+
+        a = torch.einsum("b s i h c, b t i h c -> b s t i h", q, k) * (self.c ** -0.5) # (B, s, t, i, h)
+        a = torch.nn.functional.softmax(a, dim=-3)
+
+        o = gate * torch.einsum("b s t i h, b s t h c -> b s i h c", a, v) # (B, s, i, h, c)
+        o = o.view(B, s, i, h * c)
+
+        return self.proj_o(o) # (B, s, i, c)
+
+
+class MSAColumnGlobalAttention(torch.nn.Module):
+    def __init__(self, c=8, n_head=8):
+        super().__init__()
+
+        self.c = c
+        self.n_head = n_head
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.proj_q = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_k = torch.nn.Linear(c, c, bias=False)
+        self.proj_v = torch.nn.Linear(c, c, bias=False)
+        self.proj_g = torch.nn.Linear(c, c * n_head, bias=False)
+        self.proj_o = torch.nn.Linear(c * n_head, c)
+
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, m):
+        """
+        Algorithm 19: MSA global column-wise gated self-attention
+
+        m: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        m = self.layer_norm(m)
+
+        q, k, v = self.proj_q(m), self.proj_k(m), self.proj_v(m) # (B, s, i, c * h), (B, s, i, c), (B, s, i, c)
+        B, s, i, _ = q.shape
+        h, c = self.n_head, self.c
+        q = q.view(B, s, i, h, c).mean(dim=1) # (B, i, h, c)
+        gate = self.sigmoid(self.proj_g(m)).view(B, s, i, h, c) # (B, s, i, h, c)
+
+        a = torch.einsum("b i h c, b t i c -> b t i h", q, k) * (self.c ** -0.5) # (B, t, i, h)
+        a = torch.nn.functional.softmax(a, dim=-3)
+
+        o = gate * torch.einsum("b t i h, b t i c -> b t i h c", a, v) # (B, t, i, h, c)
+        o = o.view(B, s, i, h * c)
+
+        return self.proj_o(o) # (B, s, i, c)
+
+
+class MSATransition(torch.nn.Module):
+    def __init__(self, c=32, n=4):
+        super().__init__()
+
+        self.c = c
+        self.n = n
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.proj_in = torch.nn.Linear(c, c * 4)
+        self.proj_out = torch.nn.Linear(c * 4, c)
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, m):
+        """
+        Algorithm 9: Transition layer in the MSA Stack
+        
+        m: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        m = self.layer_norm(m)
+
+        m = self.proj_in(m)
+        m = self.relu(m)
+        m = self.proj_out(m)
+
+        return m
+
+
+B, s, i, j, d = 1, 512, 227, 227, 32
+x = torch.randn(B, s, i, d).cuda()
+model = MSAColumnGlobalAttention(d, 8).cuda()
+
+print("x shape: ", x.shape)
+print("model(x) shape: ", model(x).shape)
