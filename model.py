@@ -83,8 +83,11 @@ class RecylingEmbedder(torch.nn.Module):
         self.c_m = c_m
         self.c_z = c_z
 
-        self.linear = torch.nn.Linear(c_m, c_z)
+        self.min_bin = 3.25
+        self.max_bin = 20.75
+        self.no_bins = 15
 
+        self.linear = torch.nn.Linear(self.no_bins, c_z)
         self.layernorm_m = torch.nn.LayerNorm(c_m)
         self.layernorm_z = torch.nn.LayerNorm(c_z)
 
@@ -115,14 +118,74 @@ class RecylingEmbedder(torch.nn.Module):
         d: (B, N_res, N_res)
         """
 
-        d = torch.norm((x[..., None, :] - x[..., None, :, :]), dim=-1)
-        v_bins = torch.linspace(3.25, 20.75, 15, dtype=x.dtype, device=x.device)
-        d = self.linear(self.one_hot(d, v_bins))
+        m, z = self.layernorm_m(m), self.layernorm_z(z)
 
-        z = d + self.layernorm_z(z)
-        m = self.layernorm_m(m)
+        v_bins = torch.linspace(self.min_bin, self.max_bin, self.no_bins, dtype=x.dtype, device=x.device, requires_grad=False)
+        squared_bins = v_bins ** 2
+        upper = torch.cat(
+            [squared_bins[1:], squared_bins.new_tensor([1e9])], dim=-1
+        )
+        d = torch.sum(x[..., None, :] - x[..., None, :, :], dim=-1, keepdims=True) # (B, N_res, N_res, no_bins)
+        d = ((d > squared_bins) * (d < upper)).type(x.dtype)
+        d = self.linear(d) # (B, N_res, N_res, c_z)
+
+        z = d + z
 
         return m, z
+
+
+class DropoutRowwise(torch.nn.Module):
+    def __init__(self, p=0.25):
+        super().__init__()
+
+        self.p = p
+        self.dropout = torch.nn.Dropout(p)
+
+    def forward(self, x):
+        """
+        Dropout for row-wise inputs
+
+        x: (B, N_res, N_res, c_z)
+
+        return: (B, N_res, N_res, c_z)
+        """
+        if not self.training:
+            return x
+
+
+        shape = list(x.shape)
+        shape[-3] = 1 # Row-wise
+        mask = x.new_ones(shape)
+        mask = self.dropout(mask)
+
+        return x * mask
+
+
+class DropoutColumnwise(torch.nn.Module):
+    def __init__(self, p=0.25):
+        super().__init__()
+
+        self.p = p
+        self.dropout = torch.nn.Dropout(p)
+
+    def forward(self, x):
+        """
+        Dropout for column-wise inputs
+
+        x: (B, N_res, N_res, c_z)
+
+        return: (B, N_res, N_res, c_z)
+        """
+        if not self.training:
+            return x
+
+
+        shape = list(x.shape)
+        shape[-2] = 1
+        mask = x.new_ones(shape)
+        mask = self.dropout(mask)
+
+        return x * mask
 
 
 B, N_res, c_m, c_z = 1, 227, 256, 128
