@@ -292,9 +292,82 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         return self.output(o).transpose(-2, -3) # (B, i, j, c_z)
 
 
+class TriangleMultiplicationOutgoing(torch.nn.Module):
+    def __init__(self, c=128):
+        super().__init__()
+
+        self.c = c
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.layer_norm_out = torch.nn.LayerNorm(c)
+
+        self.proj_a = torch.nn.Linear(c, c)
+        self.gate_a = torch.nn.Linear(c, c)
+        self.proj_b = torch.nn.Linear(c, c)
+        self.gate_b = torch.nn.Linear(c, c)
+        self.gate = torch.nn.Linear(c, c)
+        self.proj_o = torch.nn.Linear(c, c)
+
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, z):
+        """
+        Algorithm 11: Triangular multiplicative update using "outgoing" edges
+
+        z: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        z = self.layer_norm(z)
+
+        a = self.proj_a(z) * self.sigmoid(self.gate_a(z))
+        b = self.proj_b(z) * self.sigmoid(self.gate_b(z))
+        gate = self.sigmoid(self.gate(z))
+
+        return gate * self.proj_o(self.layer_norm_out(torch.einsum("... i k c, ... j k c -> ... i j c", a, b)))
+
+
+class TriangleMultiplicationIncoming(torch.nn.Module):
+    def __init__(self, c=128):
+        super().__init__()
+
+        self.c = c
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.layer_norm_out = torch.nn.LayerNorm(c)
+
+        self.proj_a = torch.nn.Linear(c, c)
+        self.gate_a = torch.nn.Linear(c, c)
+        self.proj_b = torch.nn.Linear(c, c)
+        self.gate_b = torch.nn.Linear(c, c)
+        self.gate = torch.nn.Linear(c, c)
+        self.proj_o = torch.nn.Linear(c, c)
+
+        self.sigmoid = torch.nn.Sigmoid()
+
+    def forward(self, z):
+        """
+        Algorithm 12: Triangular multiplicative update using "incoming" edges
+
+        z: (B, i, j, c)
+
+        return: (B, i, j, c)
+        """
+
+        z = self.layer_norm(z)
+
+        a = self.proj_a(z) * self.sigmoid(self.gate_a(z))
+        b = self.proj_b(z) * self.sigmoid(self.gate_b(z))
+        gate = self.sigmoid(self.gate(z))
+
+        return gate * self.proj_o(self.layer_norm_out(torch.einsum("... k i c, ... k j c -> ... i j c", a, b)))
+
+
+
 B, i, j, d = 1, 227, 227, 32
 x = torch.randn(B, i, j, d).cuda()
-model = TriangleAttentionStartingNode(c=d).cuda()
+model = TriangleMultiplicationIncoming(c=d).cuda()
 
 print(x.shape)
 print(model(x).shape)
