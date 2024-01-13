@@ -1,6 +1,9 @@
 import torch
 from typing import Tuple
-from einops import rearrange
+
+from Rigid import Rotation, Rigid
+
+import math
 
 class InputEmbedder(torch.nn.Module):
     def __init__(self, tf_dim, msa_dim, c_z=128, c_m=256, relpos_k=32):
@@ -852,9 +855,139 @@ class Evoformer(torch.nn.Module):
         return m, z, s
 
 
-B, s, i, j, d = 1, 512, 227, 227, 32
-x = torch.randn(B, s, i, d).cuda()
-model = MSAColumnGlobalAttention(d, 8).cuda()
+class InvariantPointAttention(torch.nn.Module):
+    def __init__(self, c=16, n_head=12, q_points=4, v_points=8):
+        super().__init__()
 
-print("x shape: ", x.shape)
-print("model(x) shape: ", model(x).shape)
+        self.c = c
+        self.n_head = n_head
+        self.q_points = q_points
+        self.v_points = v_points
+
+        self.query = torch.nn.Linear(c, c * n_head, bias=False)
+        self.key = torch.nn.Linear(c, c * n_head, bias=False)
+        self.value = torch.nn.Linear(c, c * n_head, bias=False)
+        self.bias = torch.nn.Linear(c, n_head, bias=False)
+
+        self.query_points = torch.nn.Linear(c, 3 * q_points * n_head, bias=False)
+        self.key_points = torch.nn.Linear(c, 3 * q_points * n_head, bias=False)
+        self.value_points = torch.nn.Linear(c, 3 * v_points * n_head, bias=False)
+
+        w_c = torch.tensor((2 / (9 * self.q_points)) ** 0.5, requires_grad=False)
+        w_L = torch.tensor((1 / 3) ** 0.5, requires_grad=False)
+        self.gamma = torch.nn.Parameter(torch.zeros(n_head) * 0.541324854612918)
+
+        self.register_buffer("w_c", w_c)
+        self.register_buffer("w_L", w_L)
+
+        self.linear_out = torch.nn.Linear(c * n_head * 3, c)
+        self.softplus = torch.nn.Softplus()
+    
+
+    def forward(self, s, z, T: Rigid):
+        """
+        Algorithm 22: Invariant point attention (IPA)
+
+        s: (B, i, c)
+        z: (B, i, j, c)
+        T: Rigid, (B, i) -> transformation object
+        
+        return: (B, i, c)
+        """
+
+        B, i, c = s.shape
+        h = self.n_head
+        q, k, v = self.query(s), self.key(s), self.value(s) # (B, i, c * h)
+        q, k, v = q.view(B, i, h, c), k.view(B, i, h, c), v.view(B, i, h, c)
+
+        q_points, k_points, v_points = self.query_points(s), self.key_points(s), self.value_points(s)
+        q_points, k_points, v_points = q_points.view(B, i, h * self.q_points, 3), k_points.view(B, i, h * self.q_points, 3), v_points.view(B, i, h * self.v_points, 3)
+        # (B, i, h * q_points, 3), (B, i, h * k_points, 3), (B, i, h * v_points, 3)
+
+        # (B, i, h, q_points, 3)
+        q_points = T[..., None].apply(q_points).view(B, i, h, self.q_points, 3)
+        k_points = T[..., None].apply(k_points).view(B, i, h, self.q_points, 3)
+        v_points = T[..., None].apply(v_points).view(B, i, h, self.v_points, 3)
+
+        b = self.bias(z).permute(0, 3, 1, 2) # (B, i, j, h)
+        a = q.permute(0, 2, 1, 3) @ k.permute(0, 2, 3, 1) * (self.c ** -0.5) + b # (B, h, i, j)
+
+
+        point_attention = torch.sum((q_points.unsqueeze(-4) - k_points.unsqueeze(-5)) ** 2, dim=-1) # (B, i, j, h, q_points)
+        head_weights = self.softplus(self.gamma).view(1, 1, 1, h) # (1, 1, 1, h, 1)
+        point_attention = torch.sum(point_attention, dim=-1) # (B, i, j, h)
+        point_attention *= head_weights * self.w_c * (-0.5)
+
+        a += point_attention.permute(0, 3, 1, 2) # (B, h, i, j)
+        a *= self.w_L
+        a = torch.nn.functional.softmax(a, dim=-2) # (B, h, i, j)
+
+        o = torch.einsum("b h i j, b i h c -> b i h c", a, v) # (B, i, h, c)
+        o = o.view(B, i, h * c) # (B, i, h * c)
+
+        v_points = v_points.permute(0, 2, 4, 1, 3) # (B, h, 3, i, v_points)
+        o_points = torch.sum(a[..., None, :, :, None] * v_points[..., None, :, :], dim=-2)
+        # (B, h, 3, i, v_points)
+        o_points = o_points.permute(0, 3, 1, 4, 2) # (B, i, h, v_points, 3)
+
+        o_points_norm = torch.norm(o_points, dim=-1, keepdim=False) # (B, i, h, v_points)
+        o_points_norm = torch.clamp(o_points_norm, min=1e-6).view(B, i, h * self.v_points) # (B, i, h * v_points)
+        o_points = o_points.reshape(B, i, h * self.v_points * 3) # (B, i, h * v_points, 3)
+
+        o_pair = a.transpose(-2, -3) @ z # (B, i, h, j) @ (B, i, j, c) -> (B, i, h, c)
+        o_pair = o_pair.view(B, i, h * c) # (B, i, h * c)
+
+        s = self.linear_out(torch.cat([o, o_pair, o_points, o_points_norm], dim=-1)) # (B, i, c)
+
+        return s
+
+
+class BackboneUpdate(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+        self.proj_b = torch.nn.Linear(c, 1)
+        self.proj_c = torch.nn.Linear(c, 1)
+        self.proj_d = torch.nn.Linear(c, 1)
+        self.proj_t = torch.nn.Linear(c, 3)
+
+    
+    def forward(self, s):
+        """
+        Algorithm 23: Backbone update
+
+        s: (B, i, c)
+
+        b, c, d: (B, i, 1)
+        t: (B, i, 3)
+
+        return: 
+        """
+
+        b, c, d = self.proj_b(s), self.proj_c(s), self.proj_d(s)
+        t = self.proj_t(s)
+
+        quats = torch.cat([torch.ones_like(b), b, c, d], dim=-1)
+        quats = quats / torch.norm(quats, dim=-1, keepdim=True)
+
+        rot = Rotation(quats=quats)
+        R = rot.rot_mats
+
+        rigid = Rigid(R, t)
+
+        return rigid
+       
+    
+
+B, s, i, j, c = 1, 512, 227, 227, 32
+
+s = torch.randn(B, i, c)
+z = torch.randn(B, i, j, c)
+T = Rigid(
+    Rotation(rot_mats=torch.randn(B, i, 3, 3)),
+    torch.randn(B, i, 3),
+)
+
+model = InvariantPointAttention(c, 8, 4, 8)
+model(s, z, T)
