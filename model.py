@@ -977,7 +977,54 @@ class BackboneUpdate(torch.nn.Module):
         rigid = Rigid(R, t)
 
         return rigid
+
+
+def torsion_angle_loss(a, a_true, a_alt):
+    """
+    Algorithm 27: Side chain and backbone torsion angle loss
+
+    a: (B, i, 7, 2)
+    a_true: (B, i, 7, 2)
+    a_alt: (B, i, 7, 2)
+
+    return: loss tensor
+    """
+
+    l = torch.norm(a, dim=-1, keepdim=True) # (B, i, 7, 1)
+    a = a / l # (B, i, 7, 2)
+
+    left = torch.norm(a - a_true, dim=-1)
+    right = torch.norm(a - a_alt, dim=-1)
+    L_torsion = torch.mean(torch.minimum(left ** 2, right ** 2). dim=(-1, -2)) # (B,)
+    L_anglenorm = torch.mean(torch.abs(l - 1), dim=(-1, -2)) # (B,)
+
+    return L_torsion + 0.02 * L_anglenorm
        
+
+def compute_fape(T, T_true, x, x_true, z=10, d_clamp=10, eps=1e-4):
+    """
+    Algorithm 28: Compute the Frame aligned point error
+
+    T: Rigid, (B, i) -> prediction
+    T_true: Rigid, (B, i) -> ground truth
+    both T with 3x3 rotation matrix
+
+    x: (B, i, 3) -> prediction
+    x_true: (B, i, 3) -> ground truth
+
+    return: loss tensor
+    """
+
+    x = T.invert()[..., None].apply(x[..., None, :, :])
+    x_true = T_true.invert()[..., None].apply(x_true[..., None, :, :])
+
+    d = torch.sqrt(torch.norm(x - x_true, dim=-1) + eps)
+    d = torch.clamp(d, min=0, max=d_clamp)
+
+    L_fape = torch.mean(d, dim=-1) * (1 / z)
+
+    return L_fape
+
     
 
 B, s, i, j, c = 1, 512, 227, 227, 32
