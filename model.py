@@ -995,7 +995,7 @@ def torsion_angle_loss(a, a_true, a_alt):
 
     left = torch.norm(a - a_true, dim=-1)
     right = torch.norm(a - a_alt, dim=-1)
-    L_torsion = torch.mean(torch.minimum(left ** 2, right ** 2). dim=(-1, -2)) # (B,)
+    L_torsion = torch.mean(torch.minimum(left ** 2, right ** 2), dim=(-1, -2)) # (B,)
     L_anglenorm = torch.mean(torch.abs(l - 1), dim=(-1, -2)) # (B,)
 
     return L_torsion + 0.02 * L_anglenorm
@@ -1025,7 +1025,269 @@ def compute_fape(T, T_true, x, x_true, z=10, d_clamp=10, eps=1e-4):
 
     return L_fape
 
+
+class StructureModuleTransitionLayer(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+
+        self.linear_1 = torch.nn.Linear(c, c)
+        self.linear_2 = torch.nn.Linear(c, c)
+        self.linear_3 = torch.nn.Linear(c, c)
+
+        self.relu = torch.nn.ReLU()
     
+    def forward(self, s):
+        s = s + self.linear_3(self.relu(self.linear_2(self.relu(self.linear_1(s)))))
+
+        return s
+
+class StructureModuleTransition(torch.nn.Module):
+    def __init__(self, c, n_layers, p=0.1):
+        super().__init__()
+
+        self.c = c
+        self.n_layers = n_layers
+
+        self.layers = torch.nn.ModuleList([
+                StructureModuleTransitionLayer(c)
+                for _ in range(n_layers)
+        ])
+        self.dropout = torch.nn.Dropout(p)
+        self.layer_norm = torch.nn.LayerNorm(c)
+    
+    def forward(self, s):
+        for layer in self.layers:
+            s = layer(s)
+
+        return self.layer_norm(self.dropout(s))
+
+
+class AngleResnetBlock(torch.nn.Module):
+    def __init__(self, c=128):
+        super().__init__()
+
+        self.c = c
+
+        self.linear_1 = torch.nn.Linear(c, c)
+        self.linear_2 = torch.nn.Linear(c, c)
+
+        self.relu = torch.nn.ReLU()
+
+    def forward(self, a):
+        a = a + self.linear_2(self.relu(self.linear_1(torch.relu(a))))
+
+        return a
+
+
+class AngleResnet(torch.nn.Module):
+    def __init__(self, c=128, n_layer=8, n_angle=7):
+        super().__init__()
+
+        self.c = c
+        self.n_layer = n_layer
+        self.n_angle = n_angle
+
+        self.linear_in = torch.nn.Linear(c, c)
+        self.linear_initial = torch.nn.Linear(c, c)
+
+        self.layers = torch.nn.ModuleList([
+                AngleResnetBlock(c)
+                for _ in range(n_layer)
+        ])
+        self.layer_norm = torch.nn.LayerNorm(c)
+        self.linear_out = torch.nn.Linear(c, n_angle * 2)
+
+        self.relu = torch.nn.ReLU()
+    
+    def forward(self, s, s_initial):
+        """
+        s, s_initial: (B, i, c)
+
+        return: [
+            unnomarlized_a: (B, i, 7, 2)
+            a: (B, i, 7, 2)
+        ]
+        """
+        a = self.linear_in(self.relu(s)) + self.linear_initial(self.relu(s_initial))
+
+        for layer in self.layers:
+            a = a + layer(a)
+
+        a = self.linear_out(self.relu(a)) # (B, i, 7, 2)
+        a = a.view(B, i, self.n_angle, 2)
+
+        unnomarlized_a = a.clone()
+        a = a / torch.norm(a, dim=-1, keepdim=True)
+
+        return unnomarlized_a, a
+
+
+def torsion_angles_to_frames(T, angles, aatype):
+    """
+    Algorithm 24: Compute all atom coordinates
+
+    T: Rigid, (B, i) -> transformation object
+    angles: (B, i, 7, 2)
+    aatype: (B, i) -> amino acid indices
+    """
+
+    assert angles.shape[-2] == 7
+    assert angles.shape[-1] == 2
+
+    B, n = angles.shape
+    m = torch.zeros([B, n, 8, 4, 4], device=angles.device, dtype=angles.dtype)
+    default_frames = Rigid.from_tensor_4x4(m)
+
+    sin_angles = angles[..., 0]
+    cos_angles = angles[..., 1]
+
+    sin_angles = torch.cat([torch.zeros([n, 1]), sin_angles], dim=-1)
+    cos_angles = torch.cat([torch.ones([n, 1]), cos_angles], dim=-1)
+    zeros = torch.zeros_like(sin_angles)
+    ones = torch.ones_like(sin_angles)
+
+
+    """
+    Algorithm 25: Make a transformation that rotates around the x-axis
+
+    makeRotX
+    """
+    all_rots = Rigid.from_rot_mats(torch.stack([
+        ones, zeros, zeros,
+        zeros, cos_angles, -sin_angles,
+        zeros, sin_angles, cos_angles
+    ], dim=-1).view(B, n, 8, 3, 3))
+    
+    all_frames = default_frames * all_rots
+
+    chi2_frame_to_frame = all_frames[..., 5]
+    chi3_frame_to_frame = all_frames[..., 6]
+    chi4_frame_to_frame = all_frames[..., 7]
+
+    chi1_frame_to_backbone = all_frames[..., 4]
+    chi2_frame_to_backbone = chi1_frame_to_backbone * chi2_frame_to_frame
+    chi3_frame_to_backbone = chi2_frame_to_backbone * chi3_frame_to_frame
+    chi4_frame_to_backbone = chi3_frame_to_backbone * chi4_frame_to_frame
+
+    all_frames_to_bb = Rigid.cat([
+        all_frames[..., :5],
+        chi2_frame_to_backbone[..., None],
+        chi3_frame_to_backbone[..., None],
+        chi4_frame_to_backbone[..., None],
+    ], dim=-1)
+
+    all_frames_to_global = T[..., None].compose(all_frames_to_bb)
+
+    return all_frames_to_global
+
+
+def frames_and_literature_positions_to_atom14_pos(aatype, T):
+    """
+    Algorithm 24, line 11
+
+    aatype: (B, i) -> amino acid indices
+    T: Rigid, (B, i) -> transformation object
+    """
+
+    default_4x4 = torch.zeros([B, i, 14, 4, 4], device=aatype.device, dtype=aatype.dtype)
+    
+    t_atoms_to_global = T[..., None, :]
+    t_atoms_to_global = torch.sum(t_atoms_to_global, dim=-1)
+
+    lit_positions = torch.zeros([B, i, 14, 3], device=aatype.device, dtype=aatype.dtype)
+    pred_positions = t_atoms_to_global.apply(lit_positions[..., None, :, :])
+
+    return pred_positions
+
+
+class StructureModule(torch.nn.Module):
+    def __init__(self, c=128, n_layer=8, n_head=8, p=0.25):
+        super().__init__()
+
+        self.c = c
+        self.n_layer = n_layer
+
+        self.layernorm_s = torch.nn.LayerNorm(c)
+        self.layernorm_z = torch.nn.LayerNorm(c)
+
+        self.linear_in = torch.nn.Linear(c, c)
+        self.ipa = InvariantPointAttention(c, n_head)
+        self.dropout = torch.nn.Dropout(p)
+        self.layernorm_ipa = torch.nn.LayerNorm(c)
+
+        self.transition = StructureModuleTransition(c, n_layer, p)
+        self.backbone_update = BackboneUpdate(c)
+        self.angle_resnet = AngleResnet(c, n_layer)
+
+
+    def forward(self, s_initial, z, aatype):
+        """
+        s_initial: (B, i, c)
+        z: (B, i, j, c)
+        aatype: (B, i) -> amino acid indices
+
+        return: [
+            s: (B, i, c),
+            T: Rigid, (B, i) -> transformation object
+            a: (B, i, 7, 2)
+        ]
+        """
+
+        s_initial = self.layernorm_s(s_initial)
+        z = self.layernorm_z(z)
+
+        s = self.linear_in(s_initial)
+        rigids = Rigid.identity(
+            shape=s.shape[:-1],
+            device=s.device,
+            dtype=s.dtype
+        )
+
+        outputs = []
+        for _ in range(self.n_layer):
+            s = s + self.ipa(s, z, rigids)
+            s = self.layernorm_ipa(self.dropout(s))
+            s = self.transition(s)
+
+            rigids = rigids.compose_q_update_vec(self.backbone_update(s))
+
+            backbone_to_global = Rigid(
+                Rotation(
+                    rot_mats=rigids.get_rots().get_rot_mats(), 
+                    quats=None
+                ),
+                rigids.get_trans(),
+            )
+
+            scaled_rigids = rigids.scale_translation(10)
+            unnormalized_angles, angles = self.angle_resnet(s, s_initial)
+
+            all_frames_to_global = torsion_angles_to_frames(
+                backbone_to_global, angles, aatype
+            )
+
+            pred_xyz = frames_and_literature_positions_to_atom14_pos(
+                all_frames_to_global, aatype
+            )
+            scaled_rigids = rigids.scale_translation(10)
+
+            preds = {
+                "frames": scaled_rigids.to_tensor_7(),
+                "sidechain_frames": all_frames_to_global.to_tensor_4x4(),
+                "unnormalized_angles": unnormalized_angles,
+                "angles": angles,
+                "positions": pred_xyz,
+                "states": s,
+            }
+
+            outputs.append(preds)
+
+            rigids = rigids.stop_rot_gradients()
+        
+        return outputs
+
 
 B, s, i, j, c = 1, 512, 227, 227, 32
 
