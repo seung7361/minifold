@@ -1289,6 +1289,118 @@ class StructureModule(torch.nn.Module):
         return outputs
 
 
+class PerResidueLDDTCaPredictor(torch.nn.Module):
+    def __init__(self, no_bins, c):
+        self.no_bins = no_bins
+        self.c = c
+
+        self.layer_norm = torch.nn.LayerNorm(c)
+
+        self.linear_1 = torch.nn.Linear(c, c)
+        self.linear_2 = torch.nn.Linear(c, c)
+        self.linear_3 = torch.nn.Linear(c, c)
+
+        self.relu = torch.nn.ReLU()
+    
+    def forward(self, s):
+        """
+        Algorithm 29: Predict model confidence pLDDT
+
+        s: (B, i, c)
+        """
+        s = self.layer_norm(s)
+
+        return self.linear_3(self.relu(self.linear_2(self.relu(self.linear_1(s)))))
+
+
+class DistogramHead(torch.nn.Module):
+    def __init__(self, c, no_bins):
+        super().__init__()
+
+        self.no_bins = no_bins
+        self.c = c
+
+        self.linear = torch.nn.Linear(c, no_bins)
+    
+    def forward(self, z):
+        """
+        Section 1.9.8: Distogram prediction
+
+        z: (B, i, j, c)
+
+        return: (B, i, j, no_bins) -> distogram probability distribution
+        """
+
+        logits = self.linear(z)
+        logits = logits + logits.transpose(-2, -3)
+
+        return logits # (B, i, j, no_bins)
+
+
+class TMScoreHead(torch.nn.Module):
+    def __init__(self, c, no_bins):
+        super().__init__()
+
+        self.no_bins = no_bins
+        self.c = c
+
+        self.linear = torch.nn.Linear(c, no_bins)
+
+    def forward(self, z):
+        """
+        Section 1.9.7: TM-score prediction
+
+        z: (B, i, j, c)
+
+        return: (B, i, j, no_bins) -> TM-score prediction
+        """
+
+        logits = self.linear(z)
+        return logits
+
+
+class MaskedMSAHead(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+
+        self.linear = torch.nn.Linear(c, c)
+    
+    def forward(self, m):
+        """
+        Section 1.9.9: Masked MSA prediction
+
+        m: (B, s, i, c) MSA Embedding
+
+        return: (B, s, i, c) -> MSA embedding
+        """
+
+        logits = self.linear(m)
+        return logits
+
+
+class ExperimentallyResolvedHead(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+        
+        self.linear = torch.nn.Linear(c, c)
+
+    def forward(self, s):
+        """
+        Section 1.9.10: "Experimentally resolved" prediction
+
+        s: (B, i, c)
+
+        return: (B, i, c) logits
+        """
+
+        logits = self.linear(s)
+        return logits
+
+
 B, s, i, j, c = 1, 512, 227, 227, 32
 
 s = torch.randn(B, i, c)
