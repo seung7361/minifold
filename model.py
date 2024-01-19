@@ -44,11 +44,11 @@ class InputEmbedder(torch.nn.Module):
         """
         Algorithm 4: Relative Position Encoding
 
-        ri: (B, N), residue_index
-        d: (B, N, N)
+        ri: (B, i), residue_index
+        d: (B, i, j)
         v_bins: (2 * relpos_k + 1) -> (1, 1, 2 * relpos_k + 1)
 
-        return: (B, N, N, c_z)
+        return: (B, i, j, c_z)
         """
         d = ri.unsqueeze(-1) - ri.unsqueeze(-2)
         v_bins = torch.arange(-self.relpos_k, self.relpos_k + 1, device=d.device).view(1, 1, -1)
@@ -57,7 +57,7 @@ class InputEmbedder(torch.nn.Module):
         return p
 
     
-    def forward(self, tf, ri, msa) -> Tuple[torch.Tensor, torch.Tensor]:
+    def forward(self, tf, ri, msa):
         """
         Algorithm 3: Embeddings for initial representations
         tf: (B, N_res, tf_dim)
@@ -397,6 +397,48 @@ class PairTransition(torch.nn.Module):
         return z
 
 
+class TemplateAngleEmbedder(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+        
+        self.linear1 = torch.nn.Linear(c, c)
+        self.relu = torch.nn.ReLU()
+        self.linear2 = torch.nn.Linear(c, c)
+
+    def forward(self, f):
+        """
+        Algorithm 2, line 7: Embedding of template angles
+
+        f: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        return self.linear2(self.relu(self.linear1(f)))
+
+
+class TemplatePairEmbedder(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+
+        self.linear = torch.nn.Linear(c, c)
+
+    def forward(self, f):
+        """
+        Algorithm 2, line 9: Embedding of template pairs
+
+        f: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        return self.linear(f)
+
+
 class TemplatePairStackBlock(torch.nn.Module):
     def __init__(self, c=64, n=4, n_head=4, p=0.25):
         super().__init__()
@@ -497,6 +539,26 @@ class TemplatePointwiseAttention(torch.nn.Module):
         o = o.view(B, i, j, h * c)
 
         return self.proj_o(o) # (B, i, j, c)
+
+
+class ExtraMSAEmbedder(torch.nn.Module):
+    def __init__(self, c):
+        super().__init__()
+
+        self.c = c
+
+        self.linear = torch.nn.Linear(c, c)
+
+    def forward(self, a):
+        """
+        Algorithm 2, line 15: Embedding of MSA extra features
+
+        a: (B, s, i, c)
+
+        return: (B, s, i, c)
+        """
+
+        return self.linear(a)
 
 
 class MSARowAttentionWithPairBias(torch.nn.Module):
@@ -1399,6 +1461,126 @@ class ExperimentallyResolvedHead(torch.nn.Module):
 
         logits = self.linear(s)
         return logits
+
+
+def compute_plddt(logits):
+    no_bins = logits.shape[-1]
+    bin_width = 1.0 / no_bins
+    bounds = torch.arange(
+        start=0.5 * bin_width, end=1.0, step=bin_width, device=logits.device
+    )
+
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    pred_lddt_ca = torch.sum(probs * bounds.view(1, 1, 1, no_bins), dim=-1)
+
+    return pred_lddt_ca * 100
+
+
+def compute_tm(logits, max_bin=31, no_bins=64):
+    residue_weights = logits.new_ones(logits.shape[-2])
+    boundaries = torch.linspace(
+        0, max_bin, steps=(no_bins - 1), device=logits.device
+    )
+
+    step = boundaries[1] - boundaries[0]
+    bin_centers = boundaries + step / 2
+    bin_centers = torch.cat([bin_centers, bin_centers[-1:]], dim=0)
+
+    clipped_n = max(torch.sum(residue_weights), 19)
+    d_0 = 1.24 * (clipped_n - 15) ** (1 / 3) - 1.8
+
+    probs = torch.nn.functional.softmax(logits, dim=-1)
+    f_d = 1.0 / (1 + (bin_centers / d_0) ** 2.0)
+
+    predicted_tm_term = torch.sum(probs * f_d, dim=-1)
+    normed_residue_mask = residue_weights / (1e-8 + residue_weights.sum())
+    per_alignment = torch.sum(normed_residue_mask * predicted_tm_term, dim=-1)
+
+    weighted = per_alignment * residue_weights
+
+    argmax = (weighted == torch.max(weighted)).nonzero()[0]
+
+    return per_alignment[tuple(argmax)]
+
+
+class AuxiliaryHeads(torch.nn.Module):
+    def __init__(self, c, no_bins):
+        super().__init__()
+
+        self.c = c
+        self.no_bins = no_bins
+
+        self.plddt = PerResidueLDDTCaPredictor(no_bins, c)
+        self.distogram = DistogramHead(c, no_bins)
+        self.masked_msa = MaskedMSAHead(c)
+        self.tmscore = TMScoreHead(c, no_bins)
+        self.experimentally_resolved = ExperimentallyResolvedHead(c)
+
+    def forward(self, outputs):
+        plddt_logits = self.plddt(outputs["sm"]["single"])
+        distogram_logits = self.distogram(outputs["pair"])
+        masked_msa_logits = self.masked_msa(outputs["msa"])
+        experimentally_resolved_logits = self.experimentally_resolved(outputs["single"])
+        tm_logits = self.tmscore(outputs["pair"])
+
+        aux_out = {
+            "lddt_logits": plddt_logits,
+            "plddt": compute_plddt(plddt_logits),
+            "distogram_logits": distogram_logits,
+            "masked_msa_logits": masked_msa_logits,
+            "experimentally_resolved_logits": experimentally_resolved_logits,
+            "tm_logits": tm_logits,
+            "predicted_tm_score": compute_tm(tm_logits),
+        }
+
+
+        return aux_out
+
+
+class Alphafold2(torch.nn.Module):
+    def __init__(self, n_block=48, c=384, n_head=8, p=0.25, no_bins=64):
+        super().__init__()
+
+        self.n_block = n_block
+        self.c = c
+        self.n_head = n_head
+        self.p = p
+        self.no_bins = no_bins
+
+        self.input_embedder = InputEmbedder(c)
+        self.recycling_embedder = RecylingEmbedder(c)
+
+        self.template_angle_embedder = TemplateAngleEmbedder(c)
+        self.template_pair_embedder = TemplatePairStack(c)
+        self.template_pair_stack = TemplatePairStack(c)
+        self.template_pointwise_att = TemplatePointwiseAttention(c, n_head)
+
+        self.extra_msa_embedder = ExtraMSAEmbedder(c)
+        self.extra_msa_stack = ExtraMSAStack(n_block, c, n_head, p)
+
+        self.evoformer = Evoformer(n_block, c, n_head, p)
+        self.structure_module = StructureModule(c, n_block, n_head, p)
+        self.aux_heads = AuxiliaryHeads(c, no_bins)
+
+
+    def forward(self, batch):
+        """
+        Algorithm 2: Alphafold2 inference
+
+        batch: {
+            "aatype": (B, i) -> amino acid indices
+            "residue_index": (B, i) -> residue indices
+            "target_feat": (B, i, c) -> target features
+
+            "template_aatype": (B, t, i) -> template amino acid indices
+            "template_all_atom_positions": (B, t, i, 37, 3) -> template all atom positions
+            "template_pseudo_beta": (B, t, i, 3) -> position of template carbon beta atoms
+        }
+        """
+
+        n_iters = batch["aatype"].shape[-1]
+        for cycle in range(n_iters):
+            pass
 
 
 B, s, i, j, c = 1, 512, 227, 227, 32
