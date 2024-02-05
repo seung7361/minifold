@@ -1523,7 +1523,7 @@ class AuxiliaryHeads(torch.nn.Module):
         self.experimentally_resolved = ExperimentallyResolvedHead(c)
 
     def forward(self, outputs):
-        plddt_logits = self.plddt(outputs["sm"]["single"])
+        plddt_logits = self.plddt(outputs["single"])
         distogram_logits = self.distogram(outputs["pair"])
         masked_msa_logits = self.masked_msa(outputs["msa"])
         experimentally_resolved_logits = self.experimentally_resolved(outputs["single"])
@@ -1708,32 +1708,43 @@ class Alphafold2(torch.nn.Module):
             else: # last iteration
                 outputs, m, z, x = self.iteration(batch, m, z, x, i)
             
-            print(f"{i}th iteration done.")
+            print(f"{i + 1}th iteration done.")
 
         outputs.update(self.aux_heads(outputs))
 
         return outputs
     
 
-# model = Alphafold2()
+model = Alphafold2()
 B, i, c, t, s = 1, 128, 384, 1, 1
 x = torch.randn(B, i, 3)
-# batch = {
-#     "aatype": torch.randint(0, 20, (B, i)),
-#     "residue_index": torch.randint(0, 100, (B, i)),
-#     "target_feat": torch.randn(B, i, c),
-#     "msa": torch.randn(B, s, i, c),
-#     "template_aatype": torch.randint(0, 20, (B, t, i)),
-#     "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
-#     "template_pseudo_beta": torch.randn(B, t, i, 3),
-#     "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-#     "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-#     "template_torsion_angles_mask": torch.randn(B, t, i, 7),
-#     "n_cycle": 3,
-# }
+batch = {
+    "aatype": torch.randint(0, 20, (B, i)),
+    "residue_index": torch.randint(0, 100, (B, i)),
+    "target_feat": torch.randn(B, i, c),
+    "msa": torch.randn(B, s, i, c),
+    "template_aatype": torch.randint(0, 20, (B, t, i)),
+    "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
+    "template_pseudo_beta": torch.randn(B, t, i, 3),
+    "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_torsion_angles_mask": torch.randn(B, t, i, 7),
+    "n_cycle": 1,
+}
 
-# outputs = model(batch)
-    
+with torch.no_grad():
+    outputs = model(batch)
+
+import pickle
+with open("outputs.pkl", "wb") as f:
+    pickle.dump(outputs, f)
+
+for key in outputs.keys():
+    print(key, outputs[key].shape)
+
+
+"""
+B, i, c, t, s = 1, 128, 384, 1, 1
 model = StructureModule(c)
 
 s_initial = torch.randn(B, i, c)
@@ -1741,3 +1752,7 @@ z = torch.randn(B, i, i, c)
 aatype = torch.randint(0, 20, (B, i))
 
 outputs = model(s_initial, z, aatype)
+
+for key in outputs[0].keys():
+    print(key, outputs[0][key].shape)
+"""
