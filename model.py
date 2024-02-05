@@ -2,8 +2,8 @@ import torch
 from typing import Tuple
 
 from Rigid import Rotation, Rigid
+import residue_constants as rc
 
-import math
 
 class InputEmbedder(torch.nn.Module):
     def __init__(self, tf_dim, msa_dim, c_z=128, c_m=256, relpos_k=32):
@@ -81,19 +81,18 @@ class InputEmbedder(torch.nn.Module):
 
 
 class RecylingEmbedder(torch.nn.Module):
-    def __init__(self, c_z=128, c_m=256):
+    def __init__(self, c):
         super().__init__()
 
-        self.c_m = c_m
-        self.c_z = c_z
+        self.c = c
 
         self.min_bin = 3.25
         self.max_bin = 20.75
         self.no_bins = 15
 
-        self.linear = torch.nn.Linear(self.no_bins, c_z)
-        self.layernorm_m = torch.nn.LayerNorm(c_m)
-        self.layernorm_z = torch.nn.LayerNorm(c_z)
+        self.linear = torch.nn.Linear(self.no_bins, c)
+        self.layernorm_m = torch.nn.LayerNorm(c)
+        self.layernorm_z = torch.nn.LayerNorm(c)
 
     def one_hot(self, x, v_bins):
         """
@@ -119,7 +118,10 @@ class RecylingEmbedder(torch.nn.Module):
         z: (B, N_res, N_res, c_z)
         x: (B, N_res, 3) -> predicted C_beta coordinates
 
-        d: (B, N_res, N_res)
+        return: [
+            m: (B, i, c)
+            z: (B, i, j, c)
+        ]
         """
 
         m, z = self.layernorm_m(m), self.layernorm_z(z)
@@ -129,11 +131,11 @@ class RecylingEmbedder(torch.nn.Module):
         upper = torch.cat(
             [squared_bins[1:], squared_bins.new_tensor([1e9])], dim=-1
         )
-        d = torch.sum(x[..., None, :] - x[..., None, :, :], dim=-1, keepdims=True) # (B, N_res, N_res, no_bins)
+        d = torch.sum(x[..., None, :] - x[..., None, :, :], dim=-1, keepdims=True) # (B, i, j, n_bins)
         d = ((d > squared_bins) * (d < upper)).type(x.dtype)
-        d = self.linear(d) # (B, N_res, N_res, c_z)
+        d = self.linear(d) # (B, i, j, c)
 
-        z = d + z
+        z += d
 
         return m, z
 
@@ -162,7 +164,7 @@ class DropoutRowwise(torch.nn.Module):
         mask = x.new_ones(shape)
         mask = self.dropout(mask)
 
-        return x * mask
+        return x * mask.float()
 
 
 class DropoutColumnwise(torch.nn.Module):
@@ -189,14 +191,13 @@ class DropoutColumnwise(torch.nn.Module):
         mask = x.new_ones(shape)
         mask = self.dropout(mask)
 
-        return x * mask
+        return x * mask.float()
 
 
 class TriangleAttentionStartingNode(torch.nn.Module):
-    def __init__(self, c=32, c_z=32, n_head=4):
+    def __init__(self, c=32, n_head=4):
         super().__init__()
         self.c = c
-        self.c_z = c_z
         self.n_head = n_head
 
         self.layer_norm = torch.nn.LayerNorm(c)
@@ -216,9 +217,9 @@ class TriangleAttentionStartingNode(torch.nn.Module):
 
         z: (B, i, j, c)
 
-        return: (B, i, j, c_z)
+        return: (B, i, j, c)
         """
-        
+
         z = self.layer_norm(z) # (B, i, j, c)
 
         q, k, v = self.query(z), self.key(z), self.value(z) # (B, i, j, c * h)
@@ -244,10 +245,9 @@ class TriangleAttentionStartingNode(torch.nn.Module):
     
 
 class TriangleAttentionEndingNode(torch.nn.Module):
-    def __init__(self, c=32, c_z=32, n_head=4):
+    def __init__(self, c=32, n_head=4):
         super().__init__()
         self.c = c
-        self.c_z = c_z
         self.n_head = n_head
 
         self.layer_norm = torch.nn.LayerNorm(c)
@@ -398,14 +398,15 @@ class PairTransition(torch.nn.Module):
 
 
 class TemplateAngleEmbedder(torch.nn.Module):
-    def __init__(self, c):
+    def __init__(self, c_in, c_out):
         super().__init__()
 
-        self.c = c
+        self.c_in = c_in
+        self.c_out = c_out
         
-        self.linear1 = torch.nn.Linear(c, c)
+        self.linear1 = torch.nn.Linear(c_in, c_out)
         self.relu = torch.nn.ReLU()
-        self.linear2 = torch.nn.Linear(c, c)
+        self.linear2 = torch.nn.Linear(c_out, c_out)
 
     def forward(self, f):
         """
@@ -451,8 +452,8 @@ class TemplatePairStackBlock(torch.nn.Module):
         self.dropout_row = DropoutRowwise(p)
         self.dropout_col = DropoutColumnwise(p)
 
-        self.tri_attn_start = TriangleAttentionStartingNode(c, c, n_head)
-        self.tri_attn_end = TriangleAttentionEndingNode(c, c, n_head)
+        self.tri_attn_start = TriangleAttentionStartingNode(c, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c, n_head)
         self.tri_mult_out = TriangleMultiplicationOutgoing(c)
         self.tri_mult_in = TriangleMultiplicationIncoming(c)
         self.pair_transition = PairTransition(c, n)
@@ -465,7 +466,6 @@ class TemplatePairStackBlock(torch.nn.Module):
 
         return: (B, i, j, c)
         """
-
         t += self.dropout_row(self.tri_attn_start(t))
         t += self.dropout_col(self.tri_attn_end(t))
         t = self.dropout_row(self.tri_mult_out(t))
@@ -599,16 +599,18 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
         B, s, i, _ = q.shape
         h, c = self.n_head, self.c
 
-        q = q.view(B, s, i, h, c) # (B, s, i, h, c)
-        k = k.view(B, s, i, h, c)
-        v = v.view(B, s, i, h, c)
-        b = b.view(B, 1, i, j, h) # (B, 1, i, j, h)
+        q = q.reshape(B, s, i, h, c) # (B, s, i, h, c)
+        k = k.reshape(B, s, i, h, c)
+        v = v.reshape(B, s, i, h, c)
+        b = b.reshape(B, 1, i, i, h) # (B, 1, i, j, h)
+        gate = gate.reshape(B, s, i, h, c) # (B, s, i, h, c)
 
         a = torch.einsum("b s i h c, b s j h c -> b s i j h", q, k) * (self.c ** -0.5) + b # (B, s, i, j, h)
         a = torch.nn.functional.softmax(a, dim=-2) # (B, s, i, j, h)
 
         o = gate * torch.einsum("b s i j h, b s j h c -> b s i h c", a, v) # (B, s, i, h, c)
-        o = o.view(B, s, i, h * c) # (B, s, i, h * c)
+        print("o", o.shape)
+        o = o.reshape(B, s, i, h * c) # (B, s, i, h * c)
 
         return self.proj_o(o) # (B, s, i, c)
 
@@ -627,6 +629,8 @@ class MSAColumnAttention(torch.nn.Module):
         self.proj_v = torch.nn.Linear(c, c * n_head, bias=False)
         self.proj_g = torch.nn.Linear(c, c * n_head, bias=False)
         self.proj_o = torch.nn.Linear(c * n_head, c)
+
+        self.sigmoid = torch.nn.Sigmoid()
 
     def forward(self, m):
         """
@@ -648,11 +652,13 @@ class MSAColumnAttention(torch.nn.Module):
         q = q.view(B, s, i, h, c)
         k = k.view(B, s, i, h, c)
         v = v.view(B, s, i, h, c)
+        gate = gate.view(B, s, i, h, c)
 
         a = torch.einsum("b s i h c, b t i h c -> b s t i h", q, k) * (self.c ** -0.5) # (B, s, t, i, h)
         a = torch.nn.functional.softmax(a, dim=-3)
 
-        o = gate * torch.einsum("b s t i h, b s t h c -> b s i h c", a, v) # (B, s, i, h, c)
+        print("gate", gate.shape, "a", a.shape, "v", v.shape)
+        o = gate * torch.einsum("b s t i h, b s i h c -> b s i h c", a, v) # (B, s, i, h, c)
         o = o.view(B, s, i, h * c)
 
         return self.proj_o(o) # (B, s, i, c)
@@ -752,11 +758,13 @@ class OuterProductMean(torch.nn.Module):
 
         m = self.layer_norm(m)
 
-        a, b = self.linear_a(m), self.linear_b(m)
-        outer = a.unsqueeze(2) * b.unsqueeze(3)
-        outer = outer.mean(dim=1)
+        a, b = self.linear_a(m), self.linear_b(m) # (B, s, i, c)
+        outer = torch.einsum("...sic, ...sjd -> ...sijcd", a, b) # (B, s, i, c) x (B, s, j, d) -> (B, s, i, j, c, d)
+        outer = outer.mean(dim=1) # (B, s, i, j, c, d) -> (B, i, j, c, d)
+        outer = outer.reshape(*outer.shape[:-2], -1) # (B, s, i, j, c * d)
+        outer = self.linear_out(outer) # (B, i, i, c)
 
-        return self.linear_out(outer) # (B, i, j, c)
+        return outer
 
 
 class ExtraMSAStackBlock(torch.nn.Module):
@@ -779,8 +787,8 @@ class ExtraMSAStackBlock(torch.nn.Module):
 
         self.tri_mul_out = TriangleMultiplicationOutgoing(c)
         self.tri_mul_in = TriangleMultiplicationIncoming(c)
-        self.tri_attn_start = TriangleAttentionStartingNode(c, c, n_head)
-        self.tri_attn_end = TriangleAttentionEndingNode(c, c, n_head)
+        self.tri_attn_start = TriangleAttentionStartingNode(c, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c, n_head)
         self.pair_transition = PairTransition(c, n)
     
     def forward(self, e, z):
@@ -834,26 +842,26 @@ class ExtraMSAStack(torch.nn.Module):
 
 
 class EvoformerBlock(torch.nn.Module):
-    def __init__(self, n_block=48, c_s=384, n_head=8, p=0.25):
+    def __init__(self, n_block=48, c=384, n_head=8, p=0.25):
         super().__init__()
 
         self.n_block = n_block
-        self.c_s = c_s
+        self.c = c
 
         self.dropout_row = DropoutRowwise(p)
         self.dropout_col = DropoutColumnwise(p)
 
-        self.msa_row_attn = MSARowAttentionWithPairBias(c_s, n_head)
-        self.msa_col_attn = MSAColumnAttention(c_s, n_head)
-        self.msa_transition = MSATransition(c_s)
+        self.msa_row_attn = MSARowAttentionWithPairBias(c, n_head)
+        self.msa_col_attn = MSAColumnAttention(c, n_head)
+        self.msa_transition = MSATransition(c)
 
-        self.outer_product_mean = OuterProductMean(c_s)
+        self.outer_product_mean = OuterProductMean(c)
 
-        self.tri_mul_out = TriangleMultiplicationOutgoing(c_s)
-        self.tri_mul_in = TriangleMultiplicationIncoming(c_s)
-        self.tri_attn_start = TriangleAttentionStartingNode(c_s, c_s, n_head)
-        self.tri_attn_end = TriangleAttentionEndingNode(c_s, c_s, n_head)
-        self.pair_transition = PairTransition(c_s)
+        self.tri_mul_out = TriangleMultiplicationOutgoing(c)
+        self.tri_mul_in = TriangleMultiplicationIncoming(c)
+        self.tri_attn_start = TriangleAttentionStartingNode(c, n_head)
+        self.tri_attn_end = TriangleAttentionEndingNode(c, n_head)
+        self.pair_transition = PairTransition(c)
 
     def forward(self, m, z):
         """
@@ -874,7 +882,9 @@ class EvoformerBlock(torch.nn.Module):
         m += self.msa_transition(m)
 
         # Communication
+        print("z", z.shape, "m", m.shape, "outer", self.outer_product_mean(m).shape)
         z += self.outer_product_mean(m)
+
 
         # Pair Stack
         z += self.dropout_row(self.tri_mul_out(z))
@@ -887,26 +897,26 @@ class EvoformerBlock(torch.nn.Module):
 
 
 class Evoformer(torch.nn.Module):
-    def __init__(self, n_block=48, c_s=384, n_head=8, p=0.25):
+    def __init__(self, n_block=48, c=384, n_head=8, p=0.25):
         super().__init__()
 
         self.n_block = n_block
-        self.c_s = c_s
+        self.c = c
         self.n_head = n_head
         self.p = p
 
         self.blocks = torch.nn.ModuleList([
-                EvoformerBlock(n_block, c_s, n_head, p)
+                EvoformerBlock(n_block, c, n_head, p)
                 for _ in range(n_block)
         ])
-        self.proj_o = torch.nn.Linear(c_s, c_s)
+        self.proj_o = torch.nn.Linear(c, c)
     
     def forward(self, m, z):
         """
         return: [
             m: (B, s, i, c),
             z: (B, i, j, c),
-            s: (B, i, c_s)
+            s: (B, i, c)
         ]
         """
         for block in self.blocks:
@@ -1353,6 +1363,8 @@ class StructureModule(torch.nn.Module):
 
 class PerResidueLDDTCaPredictor(torch.nn.Module):
     def __init__(self, no_bins, c):
+        super().__init__()
+
         self.no_bins = no_bins
         self.c = c
 
@@ -1535,6 +1547,16 @@ class AuxiliaryHeads(torch.nn.Module):
 
 
         return aux_out
+    
+
+def pseudo_beta_fn(aatype, all_atom_positions):
+    is_glycin = aatype == rc.RESTYPES["G"]
+    ca, cb = rc.ATOMTYPES["CA"], rc.ATOMTYPES["CB"]
+    pseudo_beta = torch.where(
+        is_glycin[..., None], all_atom_positions[..., ca, :], all_atom_positions[..., cb, :]
+    )
+
+    return pseudo_beta
 
 
 class Alphafold2(torch.nn.Module):
@@ -1547,20 +1569,117 @@ class Alphafold2(torch.nn.Module):
         self.p = p
         self.no_bins = no_bins
 
-        self.input_embedder = InputEmbedder(c)
+        self.input_embedder = InputEmbedder(c, c, c, c)
         self.recycling_embedder = RecylingEmbedder(c)
 
-        self.template_angle_embedder = TemplateAngleEmbedder(c)
-        self.template_pair_embedder = TemplatePairStack(c)
-        self.template_pair_stack = TemplatePairStack(c)
+        self.template_angle_embedder = TemplateAngleEmbedder(22 + 7 * 2 + 7 * 2 + 7, c)
+        self.template_pair_embedder = TemplatePairEmbedder(c)
+        self.template_pair_stack = TemplatePairStack(n_block, c, n_head, n_head, p)
         self.template_pointwise_att = TemplatePointwiseAttention(c, n_head)
 
         self.extra_msa_embedder = ExtraMSAEmbedder(c)
-        self.extra_msa_stack = ExtraMSAStack(n_block, c, n_head, p)
+        self.extra_msa_stack = ExtraMSAStack(n_block, c, n_head, n_head, p)
 
         self.evoformer = Evoformer(n_block, c, n_head, p)
         self.structure_module = StructureModule(c, n_block, n_head, p)
         self.aux_heads = AuxiliaryHeads(c, no_bins)
+
+
+    def build_template_angle_feat(self, batch):
+        template_aatype = batch["template_aatype"]
+        torsion_angles_sin_cos = batch["template_torsion_angles_sin_cos"]
+        alt_torsion_angles_sin_cos = batch["template_alt_torsion_angles_sin_cos"]
+        torsion_angles_mask = batch["template_torsion_angles_mask"]
+
+        B, T, I = template_aatype.shape
+
+        return torch.cat([
+            torch.nn.functional.one_hot(template_aatype, 22),
+            torsion_angles_sin_cos.reshape(B, T, I, 7 * 2),
+            alt_torsion_angles_sin_cos.reshape(B, T, I, 7 * 2),
+            torsion_angles_mask
+        ], dim=-1)
+    
+    
+    def embed_templates(self, batch, z):
+        n_templ = batch["template_aatype"].shape[-2]
+        device = batch["template_aatype"].device
+        B, i, c = batch["target_feat"].shape
+
+        t_pair = torch.zeros([B, n_templ, i, i, c], device=device)
+
+        for i_templ in range(n_templ):
+            # TODO: build_template_pair_feat
+            t = torch.zeros([B, i, i, c], device=batch["template_aatype"].device)
+            t = self.template_pair_embedder(t)
+
+            t_pair[:, i_templ, :, :, :] = t
+        
+        t_pair = t_pair.reshape(B * n_templ, i, i, c)
+        t = self.template_pair_stack(t_pair)
+        t = t.reshape(B, n_templ, i, i, c)
+        t = self.template_pointwise_att(t, z)
+
+
+        a = self.build_template_angle_feat(batch)
+        a = self.template_angle_embedder(a)
+
+        return t, a
+    
+
+    def pseudo_beta_fn(self, aatype, x):
+        """
+        output: (B, i, 3)
+        """
+
+        is_glycin = aatype == rc.RESTYPE_TO_NUM["G"]
+        ca, cb = rc.ATOMTYPE_TO_NUM["CA"], rc.ATOMTYPE_TO_NUM["CB"]
+        pseudo_beta = torch.where(
+            is_glycin[..., None], x[..., ca, :], x[..., cb, :]
+        )
+
+        return pseudo_beta
+
+    
+    # def atom14_to_atom37(atom14, batch):
+    
+    
+
+    def iteration(self, batch, m, z, x, i):
+        outputs = {}
+        B, s, i, c = batch["msa"].shape
+        
+        # input embedder
+        m, z = self.input_embedder(
+            batch["target_feat"], batch["residue_index"], batch["msa"]
+        )
+
+        # recycling embedder
+        m_, z_ = self.recycling_embedder(m, z, self.pseudo_beta_fn(batch["aatype"], x))
+        m, z = m + m_, z + z_
+
+        # template embedder
+        t, a = self.embed_templates(batch, z)
+        z += t
+        print("m", m.shape, "z", z.shape, "t", t.shape, "a", a.shape)
+        m = torch.cat([m, a], dim=-3)
+        print("m", m.shape)
+
+        # TODO: build_extra_msa_feat
+
+        # z = self.extra_msa_stack(m, z)
+
+        m, z, s = self.evoformer(m, z)
+
+        outputs["msa"] = m[..., :s, :, :]
+        outputs["pair"] = z
+        outputs["single"] = s
+        outputs["sm"] = self.structure_module(s, z, batch["aatype"])
+        # TODO: atom14_to_atom37
+        # outputs["final_atom_positions"] = atom14_to_atom37(outputs["sm"]["positions"][-1])
+        # outputs["final_atom_mask"] = batch["atom37_atom_exists"]
+
+        return outputs, m, z, x
 
 
     def forward(self, batch):
@@ -1578,19 +1697,39 @@ class Alphafold2(torch.nn.Module):
         }
         """
 
-        n_iters = batch["aatype"].shape[-1]
-        for cycle in range(n_iters):
-            pass
+        B, i, c = batch["target_feat"].shape
 
+        # intialize with zero vectors
+        m = torch.zeros([B, i, c], device=batch["target_feat"].device)
+        z = torch.zeros([B, i, i, c], device=batch["target_feat"].device)
+        x = torch.zeros([B, i, 37, 3], device=batch["target_feat"].device)
+        for i in range(batch["n_cycle"]):
+            if i == batch["n_cycle"] - 1: # last cycle
+                outputs, m, z, x = self.iteration(batch, m, z, x, i)
+            else:
+                with torch.no_grad():
+                    outputs, m, z, x = self.iteration(batch, m, z, x, i)
 
-B, s, i, j, c = 1, 512, 227, 227, 32
+        outputs.update(self.aux_heads(outputs))
 
-s = torch.randn(B, i, c)
-z = torch.randn(B, i, j, c)
-T = Rigid(
-    Rotation(rot_mats=torch.randn(B, i, 3, 3)),
-    torch.randn(B, i, 3),
-)
+        return outputs
+    
 
-model = InvariantPointAttention(c, 8, 4, 8)
-model(s, z, T)
+model = Alphafold2()
+B, i, c, t, s = 1, 128, 384, 1, 1
+x = torch.randn(B, i, 3)
+batch = {
+    "aatype": torch.randint(0, 20, (B, i)),
+    "residue_index": torch.randint(0, 100, (B, i)),
+    "target_feat": torch.randn(B, i, c),
+    "msa": torch.randn(B, s, i, c),
+    "template_aatype": torch.randint(0, 20, (B, t, i)),
+    "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
+    "template_pseudo_beta": torch.randn(B, t, i, 3),
+    "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_torsion_angles_mask": torch.randn(B, t, i, 7),
+    "n_cycle": 3,
+}
+
+outputs = model(batch)
