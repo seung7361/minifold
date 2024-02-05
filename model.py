@@ -4,6 +4,8 @@ from typing import Tuple
 from Rigid import Rotation, Rigid
 import residue_constants as rc
 
+from tqdm import tqdm
+
 
 class InputEmbedder(torch.nn.Module):
     def __init__(self, tf_dim, msa_dim, c_z=128, c_m=256, relpos_k=32):
@@ -609,7 +611,6 @@ class MSARowAttentionWithPairBias(torch.nn.Module):
         a = torch.nn.functional.softmax(a, dim=-2) # (B, s, i, j, h)
 
         o = gate * torch.einsum("b s i j h, b s j h c -> b s i h c", a, v) # (B, s, i, h, c)
-        print("o", o.shape)
         o = o.reshape(B, s, i, h * c) # (B, s, i, h * c)
 
         return self.proj_o(o) # (B, s, i, c)
@@ -657,7 +658,6 @@ class MSAColumnAttention(torch.nn.Module):
         a = torch.einsum("b s i h c, b t i h c -> b s t i h", q, k) * (self.c ** -0.5) # (B, s, t, i, h)
         a = torch.nn.functional.softmax(a, dim=-3)
 
-        print("gate", gate.shape, "a", a.shape, "v", v.shape)
         o = gate * torch.einsum("b s t i h, b s i h c -> b s i h c", a, v) # (B, s, i, h, c)
         o = o.view(B, s, i, h * c)
 
@@ -882,7 +882,6 @@ class EvoformerBlock(torch.nn.Module):
         m += self.msa_transition(m)
 
         # Communication
-        print("z", z.shape, "m", m.shape, "outer", self.outer_product_mean(m).shape)
         z += self.outer_product_mean(m)
 
 
@@ -919,7 +918,7 @@ class Evoformer(torch.nn.Module):
             s: (B, i, c)
         ]
         """
-        for block in self.blocks:
+        for block in tqdm(self.blocks):
             m, z = block(m, z)
 
         s = self.proj_o(m[:, 0, :, :])
@@ -952,7 +951,7 @@ class InvariantPointAttention(torch.nn.Module):
         self.register_buffer("w_c", w_c)
         self.register_buffer("w_L", w_L)
 
-        self.linear_out = torch.nn.Linear(c * n_head * 3, c)
+        self.linear_out = torch.nn.Linear(n_head * (c * 2 + v_points * 4), c)
         self.softplus = torch.nn.Softplus()
     
 
@@ -1044,9 +1043,8 @@ class BackboneUpdate(torch.nn.Module):
         quats = quats / torch.norm(quats, dim=-1, keepdim=True)
 
         rot = Rotation(quats=quats)
-        R = rot.rot_mats
 
-        rigid = Rigid(R, t)
+        rigid = Rigid(rot, t)
 
         return rigid
 
@@ -1208,65 +1206,61 @@ def torsion_angles_to_frames(T, angles, aatype):
     assert angles.shape[-2] == 7
     assert angles.shape[-1] == 2
 
-    B, n = angles.shape
-    m = torch.zeros([B, n, 8, 4, 4], device=angles.device, dtype=angles.dtype)
-    default_frames = Rigid.from_tensor_4x4(m)
+    default_4x4 = torch.zeros([B, i, 8, 4, 4], device=angles.device, dtype=angles.dtype)
+    default_r = T.from_tensor_4x4(default_4x4)
 
-    sin_angles = angles[..., 0]
-    cos_angles = angles[..., 1]
+    bb_rot = angles.new_zeros((*((1,) * len(angles.shape[:-1])), 2))
+    bb_rot[..., 1] = 1
 
-    sin_angles = torch.cat([torch.zeros([n, 1]), sin_angles], dim=-1)
-    cos_angles = torch.cat([torch.ones([n, 1]), cos_angles], dim=-1)
-    zeros = torch.zeros_like(sin_angles)
-    ones = torch.ones_like(sin_angles)
+    angles = torch.cat(
+        [bb_rot.expand(*angles.shape[:-2], -1, -1), angles], dim=-2
+    )
 
+    all_rots = angles.new_zeros(default_r.get_rots().get_rot_mats().shape)
+    all_rots[..., 0, 0] = 1
+    all_rots[..., 1, 1] = angles[..., 1]
+    all_rots[..., 1, 2] = -angles[..., 0]
+    all_rots[..., 2, 1:] = angles
 
-    """
-    Algorithm 25: Make a transformation that rotates around the x-axis
+    all_rots = Rigid(Rotation(rot_mats=all_rots), None)
 
-    makeRotX
-    """
-    all_rots = Rigid.from_rot_mats(torch.stack([
-        ones, zeros, zeros,
-        zeros, cos_angles, -sin_angles,
-        zeros, sin_angles, cos_angles
-    ], dim=-1).view(B, n, 8, 3, 3))
-    
-    all_frames = default_frames * all_rots
+    all_frames = default_r.compose(all_rots)
 
     chi2_frame_to_frame = all_frames[..., 5]
     chi3_frame_to_frame = all_frames[..., 6]
     chi4_frame_to_frame = all_frames[..., 7]
 
-    chi1_frame_to_backbone = all_frames[..., 4]
-    chi2_frame_to_backbone = chi1_frame_to_backbone * chi2_frame_to_frame
-    chi3_frame_to_backbone = chi2_frame_to_backbone * chi3_frame_to_frame
-    chi4_frame_to_backbone = chi3_frame_to_backbone * chi4_frame_to_frame
+    chi1_frame_to_bb = all_frames[..., 4]
+    chi2_frame_to_bb = chi1_frame_to_bb.compose(chi2_frame_to_frame)
+    chi3_frame_to_bb = chi2_frame_to_bb.compose(chi3_frame_to_frame)
+    chi4_frame_to_bb = chi3_frame_to_bb.compose(chi4_frame_to_frame)
 
-    all_frames_to_bb = Rigid.cat([
-        all_frames[..., :5],
-        chi2_frame_to_backbone[..., None],
-        chi3_frame_to_backbone[..., None],
-        chi4_frame_to_backbone[..., None],
-    ], dim=-1)
-
+    all_frames_to_bb = Rigid.cat(
+        [
+            all_frames[..., :5],
+            chi2_frame_to_bb.unsqueeze(-1),
+            chi3_frame_to_bb.unsqueeze(-1),
+            chi4_frame_to_bb.unsqueeze(-1),
+        ],
+        dim=-1,
+    )
     all_frames_to_global = T[..., None].compose(all_frames_to_bb)
 
     return all_frames_to_global
 
 
-def frames_and_literature_positions_to_atom14_pos(aatype, T):
+def frames_and_literature_positions_to_atom14_pos(T, aatype):
     """
     Algorithm 24, line 11
 
     aatype: (B, i) -> amino acid indices
     T: Rigid, (B, i) -> transformation object
     """
-
-    default_4x4 = torch.zeros([B, i, 14, 4, 4], device=aatype.device, dtype=aatype.dtype)
     
     t_atoms_to_global = T[..., None, :]
-    t_atoms_to_global = torch.sum(t_atoms_to_global, dim=-1)
+    t_atoms_to_global = t_atoms_to_global.map_tensor_fn(
+        lambda x: torch.sum(x, dim=-1)
+    )
 
     lit_positions = torch.zeros([B, i, 14, 3], device=aatype.device, dtype=aatype.dtype)
     pred_positions = t_atoms_to_global.apply(lit_positions[..., None, :, :])
@@ -1323,7 +1317,7 @@ class StructureModule(torch.nn.Module):
             s = self.layernorm_ipa(self.dropout(s))
             s = self.transition(s)
 
-            rigids = rigids.compose_q_update_vec(self.backbone_update(s))
+            rigids = self.backbone_update(s)
 
             backbone_to_global = Rigid(
                 Rotation(
@@ -1356,7 +1350,7 @@ class StructureModule(torch.nn.Module):
 
             outputs.append(preds)
 
-            rigids = rigids.stop_rot_gradients()
+            rigids = rigids.stop_rot_gradient()
         
         return outputs
 
@@ -1647,7 +1641,7 @@ class Alphafold2(torch.nn.Module):
 
     def iteration(self, batch, m, z, x, i):
         outputs = {}
-        B, s, i, c = batch["msa"].shape
+        B, n_seq, n_res, c = batch["msa"].shape
         
         # input embedder
         m, z = self.input_embedder(
@@ -1661,23 +1655,25 @@ class Alphafold2(torch.nn.Module):
         # template embedder
         t, a = self.embed_templates(batch, z)
         z += t
-        print("m", m.shape, "z", z.shape, "t", t.shape, "a", a.shape)
         m = torch.cat([m, a], dim=-3)
-        print("m", m.shape)
 
         # TODO: build_extra_msa_feat
 
         # z = self.extra_msa_stack(m, z)
 
+        print("starting evoformer...")
         m, z, s = self.evoformer(m, z)
+        print("evoformer done.")
 
-        outputs["msa"] = m[..., :s, :, :]
+        outputs["msa"] = m[..., :n_seq, :, :]
         outputs["pair"] = z
         outputs["single"] = s
         outputs["sm"] = self.structure_module(s, z, batch["aatype"])
+        """
         # TODO: atom14_to_atom37
         # outputs["final_atom_positions"] = atom14_to_atom37(outputs["sm"]["positions"][-1])
         # outputs["final_atom_mask"] = batch["atom37_atom_exists"]
+        """
 
         return outputs, m, z, x
 
@@ -1703,33 +1699,45 @@ class Alphafold2(torch.nn.Module):
         m = torch.zeros([B, i, c], device=batch["target_feat"].device)
         z = torch.zeros([B, i, i, c], device=batch["target_feat"].device)
         x = torch.zeros([B, i, 37, 3], device=batch["target_feat"].device)
+
+        print("starting iteration...")
         for i in range(batch["n_cycle"]):
-            if i == batch["n_cycle"] - 1: # last cycle
-                outputs, m, z, x = self.iteration(batch, m, z, x, i)
-            else:
+            if i != batch["n_cycle"] - 1:
                 with torch.no_grad():
                     outputs, m, z, x = self.iteration(batch, m, z, x, i)
+            else: # last iteration
+                outputs, m, z, x = self.iteration(batch, m, z, x, i)
+            
+            print(f"{i}th iteration done.")
 
         outputs.update(self.aux_heads(outputs))
 
         return outputs
     
 
-model = Alphafold2()
+# model = Alphafold2()
 B, i, c, t, s = 1, 128, 384, 1, 1
 x = torch.randn(B, i, 3)
-batch = {
-    "aatype": torch.randint(0, 20, (B, i)),
-    "residue_index": torch.randint(0, 100, (B, i)),
-    "target_feat": torch.randn(B, i, c),
-    "msa": torch.randn(B, s, i, c),
-    "template_aatype": torch.randint(0, 20, (B, t, i)),
-    "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
-    "template_pseudo_beta": torch.randn(B, t, i, 3),
-    "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-    "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-    "template_torsion_angles_mask": torch.randn(B, t, i, 7),
-    "n_cycle": 3,
-}
+# batch = {
+#     "aatype": torch.randint(0, 20, (B, i)),
+#     "residue_index": torch.randint(0, 100, (B, i)),
+#     "target_feat": torch.randn(B, i, c),
+#     "msa": torch.randn(B, s, i, c),
+#     "template_aatype": torch.randint(0, 20, (B, t, i)),
+#     "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
+#     "template_pseudo_beta": torch.randn(B, t, i, 3),
+#     "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+#     "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+#     "template_torsion_angles_mask": torch.randn(B, t, i, 7),
+#     "n_cycle": 3,
+# }
 
-outputs = model(batch)
+# outputs = model(batch)
+    
+model = StructureModule(c)
+
+s_initial = torch.randn(B, i, c)
+z = torch.randn(B, i, i, c)
+aatype = torch.randint(0, 20, (B, i))
+
+outputs = model(s_initial, z, aatype)
