@@ -1180,6 +1180,7 @@ class AngleResnet(torch.nn.Module):
             a: (B, i, 7, 2)
         ]
         """
+        B, i, c = s.shape
         a = self.linear_in(self.relu(s)) + self.linear_initial(self.relu(s_initial))
 
         for layer in self.layers:
@@ -1205,6 +1206,8 @@ def torsion_angles_to_frames(T, angles, aatype):
 
     assert angles.shape[-2] == 7
     assert angles.shape[-1] == 2
+
+    B, i, _, _ = angles.shape
 
     default_4x4 = torch.zeros([B, i, 8, 4, 4], device=angles.device, dtype=angles.dtype)
     default_r = T.from_tensor_4x4(default_4x4)
@@ -1256,6 +1259,8 @@ def frames_and_literature_positions_to_atom14_pos(T, aatype):
     aatype: (B, i) -> amino acid indices
     T: Rigid, (B, i) -> transformation object
     """
+
+    B, i = aatype.shape
     
     t_atoms_to_global = T[..., None, :]
     t_atoms_to_global = t_atoms_to_global.map_tensor_fn(
@@ -1702,10 +1707,13 @@ class Alphafold2(torch.nn.Module):
 
         print("starting iteration...")
         for i in range(batch["n_cycle"]):
-            if i != batch["n_cycle"] - 1:
-                with torch.no_grad():
-                    outputs, m, z, x = self.iteration(batch, m, z, x, i)
-            else: # last iteration
+            # if i != batch["n_cycle"] - 1:
+            #     with torch.no_grad():
+            #         outputs, m, z, x = self.iteration(batch, m, z, x, i)
+            # else: # last iteration
+            #     outputs, m, z, x = self.iteration(batch, m, z, x, i)
+
+            with torch.no_grad():
                 outputs, m, z, x = self.iteration(batch, m, z, x, i)
             
             print(f"{i + 1}th iteration done.")
@@ -1715,32 +1723,25 @@ class Alphafold2(torch.nn.Module):
         return outputs
     
 
-model = Alphafold2()
-B, i, c, t, s = 1, 128, 384, 1, 1
-x = torch.randn(B, i, 3)
-batch = {
-    "aatype": torch.randint(0, 20, (B, i)),
-    "residue_index": torch.randint(0, 100, (B, i)),
-    "target_feat": torch.randn(B, i, c),
-    "msa": torch.randn(B, s, i, c),
-    "template_aatype": torch.randint(0, 20, (B, t, i)),
-    "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
-    "template_pseudo_beta": torch.randn(B, t, i, 3),
-    "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-    "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-    "template_torsion_angles_mask": torch.randn(B, t, i, 7),
-    "n_cycle": 1,
-}
+# model = Alphafold2()
+# B, i, c, t, s = 1, 128, 384, 1, 1
+# x = torch.randn(B, i, 3)
+# batch = {
+#     "aatype": torch.randint(0, 20, (B, i)),
+#     "residue_index": torch.randint(0, 100, (B, i)),
+#     "target_feat": torch.randn(B, i, c),
+#     "msa": torch.randn(B, s, i, c),
+#     "template_aatype": torch.randint(0, 20, (B, t, i)),
+#     "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
+#     "template_pseudo_beta": torch.randn(B, t, i, 3),
+#     "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+#     "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+#     "template_torsion_angles_mask": torch.randn(B, t, i, 7),
+#     "n_cycle": 1,
+# }
 
-with torch.no_grad():
-    outputs = model(batch)
-
-import pickle
-with open("outputs.pkl", "wb") as f:
-    pickle.dump(outputs, f)
-
-for key in outputs.keys():
-    print(key, outputs[key].shape)
+# with torch.no_grad():
+#     outputs = model(batch)
 
 
 """
