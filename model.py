@@ -3,6 +3,8 @@ from typing import Tuple
 
 from Rigid import Rotation, Rigid
 import residue_constants as rc
+# from flash_attn import flash_attn_func
+# from deepspeed.ops.deepspeed4science import DS4Sci_EvoformerAttention
 
 from tqdm import tqdm
 
@@ -37,7 +39,7 @@ class InputEmbedder(torch.nn.Module):
         x = x.unsqueeze(-1)
         p = torch.argmin(torch.abs(x - v_bins), dim=-1)
 
-        p = torch.nn.functional.one_hot(p, num_classes=v_bins.shape[-1]).float()
+        p = torch.nn.functional.one_hot(p, num_classes=v_bins.shape[-1]).to(x.dtype)
 
         return p
 
@@ -53,7 +55,7 @@ class InputEmbedder(torch.nn.Module):
         return: (B, i, j, c_z)
         """
         d = ri.unsqueeze(-1) - ri.unsqueeze(-2)
-        v_bins = torch.arange(-self.relpos_k, self.relpos_k + 1, device=d.device).view(1, 1, -1)
+        v_bins = torch.arange(-self.relpos_k, self.relpos_k + 1, device=d.device, dtype=d.dtype, requires_grad=False).view(1, 1, -1)
         p = self.relpos_linear(self.one_hot(d, v_bins))
 
         return p
@@ -163,10 +165,10 @@ class DropoutRowwise(torch.nn.Module):
 
         shape = list(x.shape)
         shape[-3] = 1 # Row-wise
-        mask = x.new_ones(shape)
+        mask = x.new_ones(shape, dtype=x.dtype)
         mask = self.dropout(mask)
 
-        return x * mask.float()
+        return x * mask
 
 
 class DropoutColumnwise(torch.nn.Module):
@@ -190,10 +192,10 @@ class DropoutColumnwise(torch.nn.Module):
 
         shape = list(x.shape)
         shape[-2] = 1
-        mask = x.new_ones(shape)
+        mask = x.new_ones(shape, dtype=x.dtype)
         mask = self.dropout(mask)
 
-        return x * mask.float()
+        return x * mask
 
 
 class TriangleAttentionStartingNode(torch.nn.Module):
@@ -235,7 +237,12 @@ class TriangleAttentionStartingNode(torch.nn.Module):
         k = k.view(B, i, j, h, c)
         v = v.view(B, i, j, h, c)
         g = g.view(B, i, j, h, c)
-        b = b.view(B, i, j, 1, self.n_head) # (B, i, j, 1, h)
+        # b = b.view(B, 1, self.n_head, i, j) # (B, 1, h, j, j)
+        b = b.view(B, i, j, 1, h)
+
+        # o = g * xops.memory_efficient_attention(q, k, v, scale=(c ** 0.5), attn_bias=b) # (B, i, j, h, c)
+        # o = g * DS4Sci_EvoformerAttention(q, k, v, [None, b]) # (B, i, j, h, c)
+        
 
         a = torch.einsum("b i q h c, b i v h c -> b i q v h", q, k) * (self.c ** -0.5) + b # (B, i, r_q, r_v, h)
         a = torch.nn.functional.softmax(a, dim=-2) # (B, i, r_q, r_v, h)
@@ -286,7 +293,12 @@ class TriangleAttentionEndingNode(torch.nn.Module):
         k = k.view(B, i, j, h, c)
         v = v.view(B, i, j, h, c)
         g = g.view(B, i, j, h, c)
-        b = b.view(B, i, j, 1, self.n_head) # (B, i, j, 1, h)
+        # b = b.view(B, 1, self.n_head, i, j) # (B, i, j, 1, h)
+        b = b.view(B, i, j, 1, h)
+
+        # o = g * xops.memory_efficient_attention(q, k, v, scale=(c ** 0.5), attn_bias=b) # (B, i, j, h, c)
+
+        # o = DS4Sci_EvoformerAttention(q, k, v, [None, b]) # (B, i, j, h, c)
 
         a = torch.einsum("b i q h c, b i v h c -> b i q v h", q, k) * (self.c ** -0.5) + b # (B, i, r_q, r_v, h)
         a = torch.nn.functional.softmax(a, dim=-2)
@@ -359,7 +371,6 @@ class TriangleMultiplicationIncoming(torch.nn.Module):
 
         return: (B, i, j, c)
         """
-
         z = self.layer_norm(z)
 
         a = self.proj_a(z) * self.sigmoid(self.gate_a(z))
@@ -759,7 +770,7 @@ class OuterProductMean(torch.nn.Module):
         m = self.layer_norm(m)
 
         a, b = self.linear_a(m), self.linear_b(m) # (B, s, i, c)
-        outer = torch.einsum("...sic, ...sjd -> ...sijcd", a, b) # (B, s, i, c) x (B, s, j, d) -> (B, s, i, j, c, d)
+        outer = torch.einsum("...acb,...ade->dceb", a, b) # (B, s, i, c) x (B, s, j, d) -> (B, s, i, j, c, d)
         outer = outer.mean(dim=1) # (B, s, i, j, c, d) -> (B, i, j, c, d)
         outer = outer.reshape(*outer.shape[:-2], -1) # (B, s, i, j, c * d)
         outer = self.linear_out(outer) # (B, i, i, c)
@@ -944,12 +955,9 @@ class InvariantPointAttention(torch.nn.Module):
         self.key_points = torch.nn.Linear(c, 3 * q_points * n_head, bias=False)
         self.value_points = torch.nn.Linear(c, 3 * v_points * n_head, bias=False)
 
-        w_c = torch.tensor((2 / (9 * self.q_points)) ** 0.5, requires_grad=False)
-        w_L = torch.tensor((1 / 3) ** 0.5, requires_grad=False)
+        self.w_c = torch.tensor((2 / (9 * self.q_points)) ** 0.5, requires_grad=False)
+        self.w_L = torch.tensor((1 / 3) ** 0.5, requires_grad=False)
         self.gamma = torch.nn.Parameter(torch.zeros(n_head) * 0.541324854612918)
-
-        self.register_buffer("w_c", w_c)
-        self.register_buffer("w_L", w_L)
 
         self.linear_out = torch.nn.Linear(n_head * (c * 2 + v_points * 4), c)
         self.softplus = torch.nn.Softplus()
@@ -1008,7 +1016,7 @@ class InvariantPointAttention(torch.nn.Module):
         o_pair = a.transpose(-2, -3) @ z # (B, i, h, j) @ (B, i, j, c) -> (B, i, h, c)
         o_pair = o_pair.view(B, i, h * c) # (B, i, h * c)
 
-        s = self.linear_out(torch.cat([o, o_pair, o_points, o_points_norm], dim=-1)) # (B, i, c)
+        s = self.linear_out(torch.cat([o, o_pair, o_points, o_points_norm], dim=-1).to(s.dtype)) # (B, i, c)
 
         return s
 
@@ -1094,6 +1102,46 @@ def compute_fape(T, T_true, x, x_true, z=10, d_clamp=10, eps=1e-4):
     L_fape = torch.mean(d, dim=-1) * (1 / z)
 
     return L_fape
+
+
+def backbone_loss(batch, out):
+    # backbone_rigid_tensor = 
+    traj = out["sm"][-1]["frames"]
+    pred_aff = Rigid.from_tensor_7(traj)
+    pred_aff = Rigid(
+        Rotation(rot_mats=pred_aff.get_rots().get_rot_mats(), quats=None),
+        pred_aff.get_trans(),
+    )
+
+    gt_aff = Rigid.from_tensor_4x4(backbone_rigid_tensor)
+    fape_loss = compute_fape(
+        pred_aff, gt_aff[None],
+        pred_aff.get_trans(), gt_aff[None].get_trans(),
+    )
+    fape_loss = torch.mean(fape_loss)
+
+    return fape_loss
+
+
+def sidechain_loss(batch, out):
+    sidechain_frames = out["sm"][-1]["sidechain_frames"]
+    sidechain_atom_pos = out["sm"][-1]["positions"]
+    
+
+
+    fape = compute_fape(
+        sidechain_frames, gt_frames,
+        sidechain_atom_pos, atom14_gt_positions,
+    )
+
+def fape_loss(batch, out):
+    bb_loss = backbone_loss(batch, out)
+    sc_loss = sidechain_loss(batch, out)
+
+    loss = 0.5 * bb_loss + 0.5 * sc_loss
+    loss = torch.mean(loss)
+
+    return loss
 
 
 class StructureModuleTransitionLayer(torch.nn.Module):
@@ -1593,7 +1641,7 @@ class Alphafold2(torch.nn.Module):
         B, T, I = template_aatype.shape
 
         return torch.cat([
-            torch.nn.functional.one_hot(template_aatype, 22),
+            torch.nn.functional.one_hot(template_aatype.to(torch.int64), 22),
             torsion_angles_sin_cos.reshape(B, T, I, 7 * 2),
             alt_torsion_angles_sin_cos.reshape(B, T, I, 7 * 2),
             torsion_angles_mask
@@ -1605,11 +1653,11 @@ class Alphafold2(torch.nn.Module):
         device = batch["template_aatype"].device
         B, i, c = batch["target_feat"].shape
 
-        t_pair = torch.zeros([B, n_templ, i, i, c], device=device)
+        t_pair = torch.zeros([B, n_templ, i, i, c], device=device, dtype=batch["target_feat"].dtype)
 
         for i_templ in range(n_templ):
             # TODO: build_template_pair_feat
-            t = torch.zeros([B, i, i, c], device=batch["template_aatype"].device)
+            t = torch.zeros([B, i, i, c], device=batch["template_aatype"].device, dtype=batch["template_aatype"].dtype)
             t = self.template_pair_embedder(t)
 
             t_pair[:, i_templ, :, :, :] = t
@@ -1676,7 +1724,7 @@ class Alphafold2(torch.nn.Module):
         outputs["sm"] = self.structure_module(s, z, batch["aatype"])
         """
         # TODO: atom14_to_atom37
-        # outputs["final_atom_positions"] = atom14_to_atom37(outputs["sm"]["positions"][-1])
+        # outputs["final_atom_positions"] = atom14_to_atom37(outputs["sm"][-1]["positions"])
         # outputs["final_atom_mask"] = batch["atom37_atom_exists"]
         """
 
@@ -1701,47 +1749,68 @@ class Alphafold2(torch.nn.Module):
         B, i, c = batch["target_feat"].shape
 
         # intialize with zero vectors
-        m = torch.zeros([B, i, c], device=batch["target_feat"].device)
-        z = torch.zeros([B, i, i, c], device=batch["target_feat"].device)
-        x = torch.zeros([B, i, 37, 3], device=batch["target_feat"].device)
+        m = torch.zeros([B, i, c], device=batch["target_feat"].device, dtype=batch["target_feat"].dtype)
+        z = torch.zeros([B, i, i, c], device=batch["target_feat"].device, dtype=batch["target_feat"].dtype)
+        x = torch.zeros([B, i, 37, 3], device=batch["target_feat"].device, dtype=batch["target_feat"].dtype)
 
         print("starting iteration...")
         for i in range(batch["n_cycle"]):
-            # if i != batch["n_cycle"] - 1:
-            #     with torch.no_grad():
-            #         outputs, m, z, x = self.iteration(batch, m, z, x, i)
-            # else: # last iteration
-            #     outputs, m, z, x = self.iteration(batch, m, z, x, i)
-
-            with torch.no_grad():
+            if i != batch["n_cycle"] - 1:
+                with torch.no_grad():
+                    outputs, m, z, x = self.iteration(batch, m, z, x, i)
+            else: # last iteration
                 outputs, m, z, x = self.iteration(batch, m, z, x, i)
+
+            # with torch.no_grad():
+            #     outputs, m, z, x = self.iteration(batch, m, z, x, i)
             
             print(f"{i + 1}th iteration done.")
 
         outputs.update(self.aux_heads(outputs))
 
         return outputs
+
+
+
+
+class AlphafoldLoss(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
     
+    def forward(self, out, batch):
+        losses = {
+            "fape": fape_loss(batch, out)
+        }
 
-# model = Alphafold2()
-# B, i, c, t, s = 1, 128, 384, 1, 1
-# x = torch.randn(B, i, 3)
-# batch = {
-#     "aatype": torch.randint(0, 20, (B, i)),
-#     "residue_index": torch.randint(0, 100, (B, i)),
-#     "target_feat": torch.randn(B, i, c),
-#     "msa": torch.randn(B, s, i, c),
-#     "template_aatype": torch.randint(0, 20, (B, t, i)),
-#     "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
-#     "template_pseudo_beta": torch.randn(B, t, i, 3),
-#     "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-#     "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
-#     "template_torsion_angles_mask": torch.randn(B, t, i, 7),
-#     "n_cycle": 1,
-# }
 
-# with torch.no_grad():
-#     outputs = model(batch)
+device = "cuda:1"
+B, i, c, t, s = 1, 64, 128, 1, 1
+n_block, n_head = 48, 4
+
+model = Alphafold2(n_block, c, n_head, 0.25).half().to(device)
+
+batch = {
+    "aatype": torch.randint(0, 20, (B, i)),
+    "residue_index": torch.randint(0, 100, (B, i)),
+    "target_feat": torch.randn(B, i, c),
+    "msa": torch.randn(B, s, i, c),
+    "template_aatype": torch.randint(0, 20, (B, t, i)),
+    "template_all_atom_positions": torch.randn(B, t, i, 37, 3),
+    "template_pseudo_beta": torch.randn(B, t, i, 3),
+    "template_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_alt_torsion_angles_sin_cos": torch.randn(B, t, i, 7, 2),
+    "template_torsion_angles_mask": torch.randn(B, t, i, 7),
+    "n_cycle": 3,
+}
+
+for key in batch.keys():
+    if type(batch[key]) == torch.Tensor:
+        batch[key] = batch[key].half().to(device)
+
+outputs = model(batch)
+
+import time
+time.sleep(100)
 
 
 """

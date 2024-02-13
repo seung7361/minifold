@@ -4,7 +4,10 @@ from torch.profiler import profile, record_function, ProfilerActivity
 
 # with open("outputs.pkl", "rb") as f:
 #     outputs = pickle.load(f)
-# 
+
+# print(outputs["sm"][0].keys())
+# exit(0)
+
 # for key in outputs.keys():
 #     if type(outputs[key]) == torch.Tensor:
 #         print(key, outputs[key].shape)
@@ -33,6 +36,10 @@ batch = {
     "n_cycle": 1,
 }
 
+# for key in batch.keys():
+#     if type(batch[key]) == torch.Tensor:
+#         batch[key] = batch[key].to(device)
+
 # with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=True) as prof:
 #     with record_function("model"):
 #         model(batch)
@@ -40,9 +47,74 @@ batch = {
 # print(prof.key_averages().table(sort_by="self_cpu_memory_usage"))
 # print(prof.key_averages().table(sort_by="cpu_memory_usage"))
 
-from pytorch_memlab import LineProfiler
+layers = [
+    [
+        model.input_embedder,
+        [{
+            "shape": (B, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i),
+            "dtype": torch.long,
+        },
+        {
+            "shape": (B, i, c, c),
+            "dtype": torch.float32,
+        }],
+    ],
+    [
+        model.recycling_embedder,
+        [{
+            "shape": (B, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i, 3),
+            "dtype": torch.float32,
+        }],
+    ],
+    [
+        model.evoformer,
+        [{
+            "shape": (B, s, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i, i, c),
+            "dtype": torch.float32,
+        }]
+    ],
+    [
+        model.structure_module,
+        [{
+            "shape": (B, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i, i, c),
+            "dtype": torch.float32,
+        },
+        {
+            "shape": (B, i),
+            "dtype": torch.long,
+        }]
+    ]
+]
 
-with LineProfiler(model) as prof:
-    model(batch)
+def compute_layer_memory_usage(layer, inputs):
+    inputs = [torch.randn(*inp["shape"], dtype=inp["dtype"]) for inp in inputs]
 
-prof.display()
+    with profile(activities=[ProfilerActivity.CPU], record_shapes=True, profile_memory=True) as prof:
+        with record_function("layer"):
+            layer(*inputs)
+
+    return prof.key_averages().table(sort_by="self_cpu_memory_usage")
+
+for layer, inputs in layers:
+    print(compute_layer_memory_usage(layer, inputs))
+    print("=" * 100)
