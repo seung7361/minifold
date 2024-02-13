@@ -1194,7 +1194,7 @@ class AngleResnetBlock(torch.nn.Module):
         self.relu = torch.nn.ReLU()
 
     def forward(self, a):
-        a = a + self.linear_2(self.relu(self.linear_1(torch.relu(a))))
+        a += self.linear_2(self.relu(self.linear_1(torch.relu(a))))
 
         return a
 
@@ -1232,7 +1232,7 @@ class AngleResnet(torch.nn.Module):
         a = self.linear_in(self.relu(s)) + self.linear_initial(self.relu(s_initial))
 
         for layer in self.layers:
-            a = a + layer(a)
+            a = layer(a)
 
         a = self.linear_out(self.relu(a)) # (B, i, 7, 2)
         a = a.view(B, i, self.n_angle, 2)
@@ -1808,6 +1808,21 @@ for key in batch.keys():
         batch[key] = batch[key].half().to(device)
 
 outputs = model(batch)
+print(outputs.keys())
+
+# for key in outputs.keys():
+#     if type(outputs[key]) == torch.Tensor and outputs[key].shape == torch.Size([]):
+#         print(key, outputs[key].item())
+#     elif type(outputs[key]) == torch.Tensor:
+#         print(key, outputs[key].shape)
+#     elif type(outputs[key]) == list:
+#         print(key, len(outputs[key]))
+#     else:
+#         print(key, outputs[key])
+
+sm = outputs["sm"]
+print(sm[-1])
+
 
 import time
 time.sleep(100)
