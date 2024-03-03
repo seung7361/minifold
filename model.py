@@ -748,32 +748,32 @@ class MSATransition(torch.nn.Module):
 
 
 class OuterProductMean(torch.nn.Module):
-    def __init__(self, c=32):
+    def __init__(self, c=32, eps=1e-3):
         super().__init__()
 
         self.c = c
+        self.eps = eps
 
         self.layer_norm = torch.nn.LayerNorm(c)
         self.linear_a = torch.nn.Linear(c, c)
         self.linear_b = torch.nn.Linear(c, c)
         self.linear_out = torch.nn.Linear(c * c, c)
 
-    def forward(self, m):
-        """
-        Algorithm 10: Outer product mean
-
-        m: (B, s, i, c)
-
-        return: (B, i, j, c)
-        """
+    def forward(self, m, mask=None):
+        if mask is None:
+            mask = torch.ones(m.shape[:-1], dtype=m.dtype, device=m.device)
 
         m = self.layer_norm(m)
 
-        a, b = self.linear_a(m), self.linear_b(m) # (B, s, i, c)
-        outer = torch.einsum("...acb,...ade->dceb", a, b) # (B, s, i, c) x (B, s, j, d) -> (B, s, i, j, c, d)
-        outer = outer.mean(dim=1) # (B, s, i, j, c, d) -> (B, i, j, c, d)
-        outer = outer.reshape(*outer.shape[:-2], -1) # (B, s, i, j, c * d)
-        outer = self.linear_out(outer) # (B, i, i, c)
+        a = self.linear_a(m).transpose(-2, -3) * mask[..., None]
+        b = self.linear_b(m).transpose(-2, -3) * mask[..., None]
+
+        outer = torch.einsum("... b a c, ... d a e -> b d c e", a, b).reshape(*a.shape[:-2], -1)
+        outer = self.linear_out(outer)
+
+        norm = torch.einsum("...abc, ...adc -> ...bdc", mask[..., None], mask[..., None])
+        norm += self.eps
+        outer /= norm
 
         return outer
 
